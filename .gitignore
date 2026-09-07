@@ -39,9 +39,17 @@ htmlcov/
 
 # Maigret files
 settings.json
+web_settings.json
 
 # other
 *.egg-info
 build
 LLM
 lib
+.claude/
+
+# Sphinx i18n: .mo are compiled from .po at build time
+docs/source/locale/**/*.mo
+
+# Secrets
+.env

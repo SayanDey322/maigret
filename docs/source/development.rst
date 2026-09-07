@@ -65,6 +65,24 @@ Use the following commands to check Maigret:
   # open html report
   open htmlcov/index.html
 
+Running the tests offline
+^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Some tests reach real sites, which is why CI runs pytest with
+``--reruns 3 --reruns-delay 5``. They all carry the ``slow`` marker, so
+deselecting it leaves a suite that passes with no network at all:
+
+.. code-block:: console
+
+  pytest tests -m "not slow"
+
+This is the invocation to use when building a distribution package, since
+distribution builders run without network access. Measured on 0.6.4: the full
+suite fails 9 tests offline, ``-m "not slow"`` passes 403 and deselects 24.
+
+If you add a test that talks to the network, mark it ``slow`` — otherwise you
+silently break offline builds for every downstream packager.
+
   # get flamechart of imports to estimate startup time
   make speed
 
@@ -96,7 +114,7 @@ You should make your git commits from your maigret git repo folder, or else the 
 If you already know which site has a false-positive and want to fix it specifically, go to the next step.
 
 Otherwise, simply run a search with a random username (e.g. `laiuhi3h4gi3u4hgt`) and check the results.
-Alternatively, you can use `the Telegram bot <https://t.me/maigret_search_bot>`_.
+Alternatively, you can use the `community Telegram bot <https://maigret.app/docs-en>`_.
 
 2. Open the account link in your browser and check:
 
@@ -188,19 +206,27 @@ If you set ``urlProbe`` in ``data.json``, Maigret **fetches** that URL for the p
 
 Placeholders: ``{username}``, ``{urlMain}``, ``{urlSubpath}`` (same as for ``url``). Example: GitHub uses ``url`` ``https://github.com/{username}`` and ``urlProbe`` ``https://api.github.com/users/{username}``; Picsart uses the web profile ``https://picsart.com/u/{username}`` and probes ``https://api.picsart.com/users/show/{username}.json``.
 
-Implementation: ``make_site_result`` in `checking.py <https://github.com/soxoj/maigret/blob/main/maigret/checking.py>`_.
+.. warning::
+   ``url`` must **always** stay a human-openable profile page — it is shown to the
+   user and printed as the clickable result link. Never put an API / JSON / GraphQL
+   endpoint in ``url``; that belongs in ``urlProbe``. If the check needs an API
+   endpoint, keep the browsable profile in ``url`` and add the API URL as
+   ``urlProbe`` (e.g. Weibo: ``url`` ``https://weibo.com/n/{username}``, ``urlProbe``
+   ``https://weibo.com/ajax/profile/info?screen_name={username}``).
+
+Implementation: ``make_site_result`` in `checking.py <https://github.com/soxoj/maigret/blob/main/maigret/checking.py>`__.
 
 Site check fixes using LLM
 --------------------------
 
 .. note::
-   The ``LLM/`` directory at the root of the repository contains detailed instructions for editing site checks (in Markdown format): checklist, full guide to ``checkType`` / ``data.json`` / ``urlProbe``, handling false positives, searching for public JSON APIs, and the proposal log for ``socid_extractor``.
+   The ``LLM/`` directory at the root of the repository contains detailed instructions for editing site checks (in Markdown format): checklist, full guide to ``checkType`` / ``data.json`` / ``urlProbe``, handling false positives, searching for public JSON APIs, and the proposal log for `socid_extractor <https://socid-extractor.readthedocs.io/>`_.
 
 Main files:
 
 - `site-checks-playbook.md <https://github.com/soxoj/maigret/blob/main/LLM/site-checks-playbook.md>`_ — short checklist
 - `site-checks-guide.md <https://github.com/soxoj/maigret/blob/main/LLM/site-checks-guide.md>`_ — detailed guide
-- `socid_extractor_improvements.log <https://github.com/soxoj/maigret/blob/main/LLM/socid_extractor_improvements.log>`_ — template and entries for identity extractor improvements
+- `socid_extractor_improvements.log <https://github.com/soxoj/maigret/blob/main/LLM/socid_extractor_improvements.log>`_ — template and entries for identity extractor improvements; the upstream how-to is `Adding a scheme <https://socid-extractor.readthedocs.io/en/latest/adding-a-scheme.html>`_
 
 These files should be kept up-to-date whenever changes are made to the check logic in the code or in ``data.json``.
 
@@ -261,6 +287,8 @@ Here's how the activation process works when a JWT token becomes invalid:
 4. The activation function obtains a new JWT token and updates it in the site check record
 5. On the next site check (either through retry or a new Maigret run), the valid token is used and the check succeeds
 
+Step 5 works across runs because minted tokens are written to a per-user cache rather than back into the site database — see :ref:`activation-token-cache`.
+
 Examples of activation mechanism implementation are available in `activation.py <https://github.com/soxoj/maigret/blob/main/maigret/activation.py>`_ file.
 
 How to publish new version of Maigret
@@ -283,12 +311,29 @@ PyPi package.
 
   git checkout -b 0.4.0
 
-2. Update Maigret version in three files manually:
+2. Update Maigret version in three files manually. **All three must be in
+sync** — an earlier bump missed ``docs/source/conf.py`` and it fell behind
+by a release.
 
-- pyproject.toml
-- maigret/__version__.py 
-- docs/source/conf.py
-- snapcraft.yaml
+- ``pyproject.toml`` — single line ``version = "X.Y.Z"`` under
+  ``[tool.poetry]``. Leave every ``[tool.poetry.dependencies]`` entry
+  alone: ``python-bidi = "^0.6.3"`` is a third-party version that happens
+  to look like ours.
+- ``maigret/__version__.py`` — single line ``__version__ = 'X.Y.Z'``.
+- ``docs/source/conf.py`` — **two** Sphinx fields. ``release`` is the
+  full version (``'X.Y.Z'``); ``version`` is the short ``major.minor``
+  (``'X.Y'``, **without** the patch number). Update **both**.
+
+``snap/snapcraft.yaml`` is **not** in this list any more. It carries
+``adopt-info: maigret`` and reads the version out of
+``maigret/__version__.py`` at build time, so it follows automatically.
+
+After editing, check that nothing was missed:
+
+.. code-block:: console
+
+  grep -rn '<old version>' --include='*.toml' --include='*.py' \
+    --include='*.yaml' --include='*.yml' . | grep -v CHANGELOG
 
 3. Create a new empty text section in the beginning of the file `CHANGELOG.md` with a current date:
 
@@ -303,9 +348,28 @@ PyPi package.
 - Click `Create new tag`
 - Press `+ Auto-generate release notes`
 - Copy all the text from description text field below
-- Paste it to empty text section in `CHANGELOG.txt`
-- Remove redundant lines `## What's Changed` and `## New Contributors` section if it exists
+- Paste it to empty text section in `CHANGELOG.md`
 - *Close the new release page*
+
+Keep the ``## What's Changed`` heading, the ``## New Contributors``
+section and the ``**Full Changelog**`` line — every existing section in
+``CHANGELOG.md`` has them.
+
+The same notes can be generated without opening the browser, which is
+handy when you want them in a file:
+
+.. code-block:: console
+
+  gh api repos/soxoj/maigret/releases/generate-notes \
+    -f tag_name=v0.4.0 -f previous_tag_name=v0.3.9 -f target_commitish=main \
+    --jq '.body' > notes.md
+
+This is the same generator the `+ Auto-generate release notes` button
+calls, so the contributor handles are the real GitHub logins. Do not
+assemble the list from ``git log`` instead: authors who commit without a
+``@users.noreply.github.com`` address have no derivable handle there, and
+guessing from the display name produces entries like ``@Danilo Salve``
+that are not valid GitHub users.
 
 5. Commit all the changes, push, make pull request
 
@@ -323,10 +387,44 @@ PyPi package.
 - Open https://github.com/soxoj/maigret/releases/new again
 - Click `Choose a tag`
 - Enter actual version in format `v0.4.0`
-- Also enter actual version in the field `Release title` 
 - Click `Create new tag`
+- **Set** `Target` **to your version branch** (``0.4.0``), not ``main``
+- Also enter actual version in the field `Release title`
 - Press `+ Auto-generate release notes`
 - **Press "Publish release" button**
+
+.. warning::
+
+   ``Target`` defaults to ``main``, and that default is wrong here. The
+   tag must point at a commit that already contains the bumped version —
+   otherwise the tag lands on the tip of ``main``, where the version is
+   still the previous one, and ``python-publish.yml`` builds and tries to
+   upload a package with the **old** version number. PyPI rejects it as a
+   duplicate and the release job fails.
+
+   This is why the release tags of ``v0.6.1``, ``v0.6.2`` and ``v0.6.3``
+   all point at commits on their version branches rather than at ``main``.
+   Merging the pull request from step 6 first is *not* required — pointing
+   the tag at the version branch is what matters.
+
+   To check a published tag: ``git show v0.4.0:maigret/__version__.py``
+   must print the new version.
+
+The whole step can be done from the command line instead. ``--target``
+takes a branch name or a commit SHA:
+
+.. code-block:: console
+
+  gh release create v0.4.0 --target 0.4.0 --title v0.4.0 --notes-file notes.md
+
+If a release was published against the wrong target, delete it together
+with its tag and recreate it — the ``release: published`` event fires
+again and PyPI upload is retried:
+
+.. code-block:: console
+
+  gh release delete v0.4.0 --cleanup-tag --yes
+  gh release create v0.4.0 --target 0.4.0 --title v0.4.0 --notes-file notes.md
 
 8. That's all, now you can simply wait push to PyPi. You can monitor it in Action page: https://github.com/soxoj/maigret/actions/workflows/python-publish.yml
 
@@ -338,10 +436,82 @@ Documentations is auto-generated and auto-deployed from the ``docs`` directory.
 To manually update documentation:
 
 1. Change something in the ``.rst`` files in the ``docs/source`` directory.
-2. Install ``pip install -r requirements.txt`` in the docs directory.
+2. Install ``python -m pip install -e .`` in the docs directory.
 3. Run ``make singlehtml`` in the terminal in the docs directory.
 4. Open ``build/singlehtml/index.html`` in your browser to see the result.
-5. If everything is ok, commit and push your changes to GitHub. 
+5. If you edited any English ``.rst`` text (not just code blocks), refresh the
+   per-language translation catalogs — see *Translations* below. Skipping this
+   step lets the non-English builds silently fall back to English on the
+   changed strings.
+6. If everything is ok, commit and push your changes to GitHub.
+
+Translations
+------------
+
+The docs are translated via Sphinx's standard gettext workflow. English ``.rst`` files
+are the source of truth; translations live as ``.po`` catalogs under
+``docs/source/locale/<lang>/LC_MESSAGES/`` (currently only ``zh_CN``).
+
+After editing any English ``.rst`` file, refresh the catalogs so existing
+translations stay aligned with the new strings:
+
+.. code-block:: bash
+
+   cd docs
+   make intl-update LANG=zh_CN
+
+This regenerates the ``.pot`` files via ``sphinx-build -b gettext`` and runs
+``sphinx-intl update`` to merge them into the per-language ``.po`` files. New
+English strings appear with an empty ``msgstr ""``; changed strings get a
+``#, fuzzy`` marker that translators should review and re-translate.
+
+Preview a translated build locally:
+
+.. code-block:: bash
+
+   make html-zh_CN
+   open build/html_zh_CN/index.html
+
+CJK escape-spaces gotcha
+^^^^^^^^^^^^^^^^^^^^^^^^
+
+reStructuredText inline markup (bold, inline code, hyperlinks) requires
+whitespace or punctuation on both sides to close. In English this is free: a
+space or full stop always follows. In Chinese / Japanese / Korean translations
+the next character is often a CJK letter with no separator, and docutils then
+emits warnings like::
+
+   <translated>:1: WARNING: Inline strong start-string without end-string.
+   <translated>:1: WARNING: Inline interpreted text or phrase reference start-string without end-string.
+
+The fix is an explicit RST escape-space — a backslash followed by a space —
+between the closing marker and the next CJK character. In the rendered ``.rst``
+this is written as ``\<space>``; inside a ``.po`` ``msgstr`` it must be
+written as ``\\<space>`` because the ``.po`` parser eats one backslash level.
+
+.. code-block:: po
+
+   # WRONG — warning, markup leaks past the bold
+   msgstr "让**所有**检查请求通过指定代理"
+
+   # RIGHT — regular space breaks markup cleanly
+   msgstr "让 **所有** 检查请求通过指定代理"
+
+   # RIGHT — escape-space when no visual space is wanted
+   msgstr "让\\ **所有**\\ 检查请求通过指定代理"
+
+The same rule applies after inline code before a CJK character, and after a
+hyperlink before a CJK opening bracket — always insert ``\\<space>``. After
+editing any ``.po`` file, run ``make html-zh_CN``; these warnings only surface
+at build time.
+
+To add a new language, run ``make intl-update LANG=<code>`` (e.g. ``ja``,
+``de``, ``pt_BR``) — this scaffolds an empty catalog. Read the Docs publishes
+each language as a separate project linked under the parent (see the
+`Localization guide <https://docs.readthedocs.com/platform/stable/localization.html>`_);
+a maintainer needs to create the translation project once in the RTD admin UI,
+set its language, and mark it as a translation of the main ``maigret`` project
+to enable the language switcher.
 
 Roadmap
 -------

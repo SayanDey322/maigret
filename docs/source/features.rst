@@ -33,10 +33,24 @@ Instructions:
 
 3. Wait a bit for the search to complete and view the graph with results, the table with all accounts found, and download reports of all formats.
 
+.. _telegram-bot:
+
+Telegram bot
+------------
+
+A community-maintained Telegram bot lets you run Maigret without
+installing anything locally.
+
+- Working instance: `maigret.app/docs-en
+  <https://maigret.app/docs-en>`_ (redirect — the hosted bot may move
+  between providers).
+- Source code: `github.com/soxoj/maigret-tg-bot
+  <https://github.com/soxoj/maigret-tg-bot>`_.
+
 Personal info gathering
 -----------------------
 
-Maigret does the `parsing of accounts webpages and extraction <https://github.com/soxoj/socid-extractor>`_ of personal info, links to other profiles, etc.
+Maigret does the `parsing of accounts webpages and extraction <https://socid-extractor.readthedocs.io/en/latest/how-extraction-works.html>`_ of personal info, links to other profiles, etc.
 Extracted info displayed as an additional result in CLI output and as tables in HTML and PDF reports.
 Also, Maigret use found ids and usernames from links to start a recursive search.
 
@@ -134,7 +148,10 @@ Thanks to `@balestek <https://github.com/balestek>`_ for the idea and implementa
 Reports 
 -------
 
-Maigret currently supports HTML, PDF, TXT, XMind 8 mindmap, and JSON reports.
+Maigret currently supports HTML, PDF, TXT, CSV, XMind 8 mindmap, JSON, and
+Markdown reports, plus graph exports: an interactive HTML graph (``--graph``)
+and a Neo4j Cypher script (``--neo4j``) for loading the results into a graph
+database.
 
 HTML/PDF reports contain:
 
@@ -144,8 +161,39 @@ HTML/PDF reports contain:
 
 Also, there is a short text report in the CLI output after the end of a searching phase.
 
+The ``--neo4j`` flag serialises the same graph that ``--graph`` builds into an
+idempotent ``.cypher`` script, importable with ``cypher-shell`` or the Neo4j
+Browser. See :ref:`neo4j-export` for the schema and import instructions.
+
 .. warning::
    XMind 8 mindmaps are incompatible with XMind 2022!
+
+AI analysis
+-----------
+
+Maigret can produce a short, human-readable investigation summary on top
+of the raw search results using the ``--ai`` flag. It builds the
+internal Markdown report, sends it to an OpenAI-compatible chat
+completion endpoint, and streams the model's reply directly to the
+terminal.
+
+.. code-block:: console
+
+   export OPENAI_API_KEY=sk-...
+   maigret username --ai
+
+The summary uses a fixed format with the most likely real name,
+location, occupation, interests, languages, main website, username
+variants, number of platforms, active years, a confidence rating, and a
+short list of follow-up leads. While ``--ai`` is active, per-site
+progress and the short text report are suppressed so the streamed
+summary is the main output.
+
+The endpoint, model, and API key are configured via ``settings.json``
+(``openai_api_key``, ``openai_model``, ``openai_api_base_url``) or the
+``OPENAI_API_KEY`` environment variable. Any OpenAI-compatible API can
+be used (Azure OpenAI, OpenRouter, a local server, …). See
+:ref:`ai-analysis` and :ref:`settings` for details.
 
 Tags
 ----
@@ -210,6 +258,65 @@ The Maigret database contains not only the original websites, but also mirrors, 
 
 It allows getting additional info about the person and checking the existence of the account even if the main site is unavailable (bot protection, captcha, etc.)
 
+.. _cloudflare-bypass:
+
+Cloudflare webgate bypass
+-------------------------
+
+.. warning::
+
+   **Experimental feature.** The Cloudflare webgate is under active
+   development. The configuration schema, CLI flag behaviour, and the set
+   of sites that route through it may change without backwards-compatibility
+   guarantees. Expect rough edges (CF rate limits, occasional solver
+   failures) and report issues so they can be ironed out.
+
+Some sites sit behind a full Cloudflare JavaScript challenge or a CF firewall
+hard block — these are tagged ``protection: ["cf_js_challenge"]`` or
+``protection: ["cf_firewall"]`` in the database and are normally kept disabled
+because neither aiohttp nor curl_cffi can solve the JS challenge on their own.
+
+Maigret can offload these checks to a local Chrome-based solver. Two backends
+are supported, configured in ``settings.json`` under
+``cloudflare_bypass.modules`` (the first reachable module wins; subsequent
+ones are tried as a fallback chain):
+
+* **FlareSolverr** (recommended). Runs a real Chrome instance and exposes a
+  JSON API. The upstream HTTP status, headers and final URL are preserved, so
+  ``checkType: status_code`` and ``checkType: response_url`` keep working
+  through the bypass.
+
+  .. code-block:: console
+
+    docker run -d -p 8191:8191 --name flaresolverr ghcr.io/flaresolverr/flaresolverr:latest
+
+* **CloudflareBypassForScraping** (legacy fallback). Returns rendered HTML
+  only, so the upstream status code is lost — ``checkType: message`` keeps
+  working but ``status_code`` checks misfire (treated as 200 on success).
+
+Activate the bypass either with the CLI flag::
+
+    maigret --cloudflare-bypass <username>
+
+or by setting ``cloudflare_bypass.enabled`` to ``true`` in ``settings.json``.
+The web UI (``python -m maigret.web.app``) reads the same setting — there is
+no separate toggle in the form, so flipping ``enabled`` is what activates
+the bypass for browser-driven runs.
+
+The bypass only fires for sites whose ``protection`` field intersects
+``cloudflare_bypass.trigger_protection`` (default
+``["cf_js_challenge", "cf_firewall", "webgate"]``); all other sites use the
+normal aiohttp / curl_cffi path.
+
+If all configured modules are unreachable, affected sites get an UNKNOWN
+status with an actionable error pointing at the first module's URL — the
+fix is almost always to start the FlareSolverr container.
+
+FlareSolverr session reuse is automatic: Maigret pins a single
+``session: <session_prefix>-<pid>`` per run, so cf_clearance cookies are
+shared between checks of the same domain (5–10× faster on subsequent
+requests to that host).
+
 Activation
 ----------
 The activation mechanism helps make requests to sites requiring additional authentication like cookies, JWT tokens, or custom headers.
@@ -267,4 +374,4 @@ Simple API
 
 Maigret can be easily integrated with the use of Python package `maigret <https://pypi.org/project/maigret/>`_.
 
-Example: the official `Telegram bot <https://github.com/soxoj/maigret-tg-bot>`_
+Example: the community `Telegram bot <https://github.com/soxoj/maigret-tg-bot>`_

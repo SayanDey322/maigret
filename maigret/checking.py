@@ -2,35 +2,114 @@
 import ast
 import asyncio
 import logging
+import os
 import random
 import re
 import ssl
 import sys
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import quote
+from unittest.mock import Mock
+from urllib.parse import quote, urlparse
 
 # Third party imports
 import aiodns
 from alive_progress import alive_bar
 from aiohttp import ClientSession, TCPConnector, http_exceptions
-from aiohttp.client_exceptions import ClientConnectorError, ServerDisconnectedError
-from python_socks import _errors as proxy_errors
-from socid_extractor import extract  # type: ignore[import-not-found]
-
-try:
-    from mock import Mock
-except ImportError:
-    from unittest.mock import Mock
+from aiohttp.resolver import ThreadedResolver
+from aiohttp.client_exceptions import (
+    ClientConnectorDNSError,
+    ClientConnectorError,
+    ClientPayloadError,
+    ServerDisconnectedError,
+)
+from aiohttp_socks import ProxyConnectionError, ProxyError, ProxyTimeoutError
+from socid_extractor import extract, mutate_url  # type: ignore[import-not-found]
 
 # Local imports
 from . import errors
 from .activation import ParsingActivator, import_aiohttp_cookies
+from .error_detection import detect_error_page
 from .errors import CheckError
 from .executors import AsyncioQueueGeneratorExecutor
-from .result import MaigretCheckResult, MaigretCheckStatus
+from .result import MaigretCheckResult, MaigretCheckStatus, KeywordMatchStatus, SiteResult
 from .sites import MaigretDatabase, MaigretSite
-from .types import QueryOptions, QueryResultWrapper
-from .utils import ascii_data_display, get_random_user_agent
+from .utils import ascii_data_display, get_random_user_agent, is_plausible_username
+
+
+_DNS_ERROR_MARKERS = (
+    "could not contact dns servers",  # aiohttp + aiodns wording
+    "name or service not known",       # glibc getaddrinfo
+    "nodename nor servname",           # macOS getaddrinfo
+    "temporary failure in name resolution",  # glibc EAI_AGAIN
+    "getaddrinfo failed",              # generic socket error
+)
+
+
+def _is_dns_error(exc: Exception) -> bool:
+    """Classify a ClientConnectorError as DNS-class or not.
+
+    Prefers the typed aiohttp subclass; falls back to substring matching on
+    the exception text for resolver/getaddrinfo errors that don't surface as
+    ClientConnectorDNSError. The substrings are the OS/aiodns wordings
+    observed in the wild.
+    """
+    if isinstance(exc, ClientConnectorDNSError):
+        return True
+    text = str(exc).lower()
+    return any(m in text for m in _DNS_ERROR_MARKERS)
+
+
+# The two HTTP transports disagree about what a SOCKS5 proxy URL means.
+#
+#   python_socks (via aiohttp_socks, used by SimpleAiohttpChecker)
+#     accepts exactly socks5/socks4/http and raises
+#     ValueError('Invalid scheme component: socks5h') on anything else, so
+#     socks5h:// is a hard crash before a single request is made. Its rdns
+#     flag defaults to True for SOCKS5, so socks5:// there already means
+#     proxy-side DNS.
+#
+#   libcurl (via curl_cffi, used by CurlCffiChecker for tls_fingerprint sites)
+#     keeps the classic distinction: socks5:// resolves the hostname on the
+#     client and passes an address to the proxy, socks5h:// passes the
+#     hostname and lets the proxy resolve it.
+#
+# So a single `--proxy socks5://...` resolves most of the database at the
+# proxy but the tls_fingerprint sites locally: their hostnames leak to the
+# local resolver, and geo-balanced hosts get resolved for the wrong network.
+# See issue #2955.
+#
+# Normalizing the scheme per transport makes both spellings mean proxy-side
+# DNS everywhere, so users need not know which transport handles which site.
+# Only SOCKS5 is remapped: python_socks defaults rdns to False for SOCKS4,
+# so rewriting socks4 would change behavior instead of aligning it.
+PYTHON_SOCKS_TRANSPORT = 'python_socks'
+LIBCURL_TRANSPORT = 'libcurl'
+
+_PROXY_SCHEME_ALIASES = {
+    PYTHON_SOCKS_TRANSPORT: {'socks5h': 'socks5'},
+    LIBCURL_TRANSPORT: {'socks5': 'socks5h'},
+}
+
+
+def normalize_proxy_scheme(proxy: Optional[str], transport: str) -> Optional[str]:
+    """Rewrite a proxy URL's scheme to the spelling `transport` understands.
+
+    Only the scheme is rewritten; host, port, credentials and path are passed
+    through as given, as are non-SOCKS5 schemes, schemeless values and empty
+    values.
+    """
+    if not proxy:
+        return proxy
+
+    scheme, separator, remainder = proxy.partition('://')
+    if not separator:
+        return proxy
+
+    replacement = _PROXY_SCHEME_ALIASES[transport].get(scheme.lower())
+    if replacement is None:
+        return proxy
+
+    return f'{replacement}://{remainder}'
 
 
 SUPPORTED_IDS = (
@@ -43,34 +122,99 @@ SUPPORTED_IDS = (
     "steam_id",
     "uidme_uguid",
     "yelp_userid",
+    "orcid",
+    "qq_id",
+    "bilibili_id",
 )
 
 BAD_CHARS = "#"
 
 
+def build_cloudflare_bypass_config(
+    settings_obj: Optional[Any], force_enable: bool = False
+) -> Optional[Dict[str, Any]]:
+    """Resolve Cloudflare webgate config from settings + CLI flag.
+
+    Returns ``None`` when bypass is inactive or no usable module is configured.
+    Otherwise returns a dict consumed by ``CloudflareWebgateChecker``:
+
+      - ``trigger_protection``: list of ``site.protection`` values that
+        activate the bypass (e.g. ``["cf_js_challenge", "cf_firewall", "webgate"]``)
+      - ``modules``: ordered list of backend modules to try; each entry has
+        ``name``, ``method`` (``json_api`` for FlareSolverr, ``url_rewrite``
+        for CloudflareBypassForScraping), and a method-specific ``url`` plus
+        optional ``max_timeout_ms``.
+      - ``session_prefix``: prefix for FlareSolverr session reuse.
+    """
+    raw = {}
+    if settings_obj is not None:
+        raw = getattr(settings_obj, "cloudflare_bypass", {}) or {}
+    enabled = bool(force_enable) or bool(raw.get("enabled", False))
+    if not enabled:
+        return None
+
+    modules_raw = raw.get("modules") or []
+    valid_modules: List[Dict[str, Any]] = []
+    for module in modules_raw:
+        method = module.get("method")
+        url = module.get("url")
+        if method == "json_api" and url:
+            valid_modules.append(dict(module))
+        elif method == "url_rewrite" and url and "{url}" in url:
+            valid_modules.append(dict(module))
+    if not valid_modules:
+        return None
+
+    trigger = raw.get("trigger_protection") or [
+        "cf_js_challenge",
+        "cf_firewall",
+        "webgate",
+    ]
+    return {
+        "trigger_protection": list(trigger),
+        "modules": valid_modules,
+        "session_prefix": raw.get("session_prefix", "maigret"),
+    }
+
+
 class CheckerBase:
-    pass
-
-
-class SimpleAiohttpChecker(CheckerBase):
     def __init__(self, *args, **kwargs):
-        self.proxy = kwargs.get('proxy')
-        self.cookie_jar = kwargs.get('cookie_jar')
         self.logger = kwargs.get('logger', Mock())
+        # Defaults for the request fields populated by .prepare(). Set here
+        # so subclasses with a partial prepare() (e.g. AiodnsDomainResolver
+        # only assigns url) still have predictable attribute access.
         self.url = None
         self.headers = None
         self.allow_redirects = True
         self.timeout = 0
         self.method = 'get'
         self.payload = None
+        self.encoding = None
 
-    def prepare(self, url, headers=None, allow_redirects=True, timeout=0, method='get', payload=None):
+
+class SimpleAiohttpChecker(CheckerBase):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.proxy = normalize_proxy_scheme(kwargs.get('proxy'), PYTHON_SOCKS_TRANSPORT)
+        self.cookie_jar = kwargs.get('cookie_jar')
+        # 'async' (default) uses aiohttp's DefaultResolver, which is AsyncResolver
+        # (powered by aiodns / c-ares) when aiodns is installed. 'threaded' uses
+        # ThreadedResolver, which wraps the OS getaddrinfo via a threadpool —
+        # slower for high concurrency, but respects the system DNS config
+        # (resolv.conf, Windows network adapter settings) instead of having
+        # aiodns rediscover it. See issue #2688: aiodns can fail to find any
+        # DNS server on Windows / VPN / corporate networks, producing
+        # "Could not contact DNS servers" for every site.
+        self.dns_resolver = kwargs.get('dns_resolver', 'async')
+
+    def prepare(self, url, headers=None, allow_redirects=True, timeout=0, method='get', payload=None, encoding=None):
         self.url = url
         self.headers = headers
         self.allow_redirects = allow_redirects
         self.timeout = timeout
         self.method = method
         self.payload = payload
+        self.encoding = encoding
         return None
 
     async def close(self):
@@ -79,59 +223,105 @@ class SimpleAiohttpChecker(CheckerBase):
     async def _make_request(
         self, session, url, headers, allow_redirects, timeout, method, logger, payload=None
     ) -> Tuple[Optional[str], int, Optional[CheckError]]:
-        try:
-            if method.lower() == 'get':
-                request_method = session.get
-            elif method.lower() == 'post':
-                request_method = session.post
-            elif method.lower() == 'head':
-                request_method = session.head
-            else:
-                request_method = session.get
+        if method.lower() == 'get':
+            request_method = session.get
+        elif method.lower() == 'post':
+            request_method = session.post
+        elif method.lower() == 'head':
+            request_method = session.head
+        else:
+            request_method = session.get
 
-            kwargs = {
-                'url': url,
-                'headers': headers,
-                'allow_redirects': allow_redirects,
-                'timeout': timeout,
-            }
-            if payload and method.lower() == 'post':
-                if headers and headers.get('Content-Type') == 'application/x-www-form-urlencoded':
-                    kwargs['data'] = payload
+        kwargs = {
+            'url': url,
+            'headers': headers,
+            'allow_redirects': allow_redirects,
+            'timeout': timeout,
+        }
+        if payload and method.lower() == 'post':
+            if headers and headers.get('Content-Type') == 'application/x-www-form-urlencoded':
+                kwargs['data'] = payload
+            else:
+                kwargs['json'] = payload
+
+        # A rotating (residential) proxy occasionally switches exit node
+        # mid-request: aiohttp surfaces this as a truncated body
+        # (ClientPayloadError, wrapping the underlying TransferEncodingError
+        # or ContentLengthError), a dropped connection (ServerDisconnectedError),
+        # or a failure to reach/handshake with the picked proxy node
+        # (aiohttp_socks' ProxyConnectionError/ProxyTimeoutError — NOT
+        # python_socks' same-named classes, which this connector never
+        # raises). One retry on a fresh connection is enough — the pooled
+        # connection is already discarded, so the retry goes out through a
+        # new exit node. A generic ProxyError (e.g. bad credentials) is
+        # deliberately NOT retried: it fails identically every time, so
+        # retrying it would just double the cost of every check for no gain.
+        transient_retries = 1
+        for attempt in range(transient_retries + 1):
+            try:
+                async with request_method(**kwargs) as response:
+                    status_code = response.status
+                    # A response_url check runs with redirects disabled, so any
+                    # 3xx reads as "user not found". Some sites intermittently
+                    # bounce a request back to the SAME url to plant a session
+                    # cookie (joyreactor.cc: 302 + `Set-Cookie: jr_captcha=1`,
+                    # roughly one request in five to seven): that is not a
+                    # not-found, it is a retry request. The session keeps the
+                    # cookie, so one repeat returns the real page. Set-Cookie
+                    # is what makes it a handshake — without it, a site that
+                    # always self-redirects would just cost two requests.
+                    if (
+                        not allow_redirects
+                        and 300 <= status_code < 400
+                        and str(response.headers.get("Location", "")) == url
+                        and response.headers.get("Set-Cookie")
+                        and attempt < transient_retries
+                    ):
+                        logger.debug(f"Self-redirect to {url}, retrying")
+                        continue
+                    response_content = await response.content.read()
+                    charset = self.encoding or response.charset or "utf-8"
+                    decoded_content = response_content.decode(charset, "ignore")
+
+                    error = CheckError("Connection lost") if status_code == 0 else None
+                    logger.debug(decoded_content)
+
+                    return decoded_content, status_code, error
+
+            except asyncio.TimeoutError as e:
+                return None, 0, CheckError("Request timeout", str(e))
+            except ClientConnectorError as e:
+                err_type = "Connecting failure (DNS)" if _is_dns_error(e) else "Connecting failure"
+                return None, 0, CheckError(err_type, str(e))
+            except ServerDisconnectedError as e:
+                if attempt < transient_retries:
+                    logger.debug(f"Server disconnected, retrying: {e}")
+                    continue
+                return None, 0, CheckError("Server disconnected", str(e))
+            except (ProxyConnectionError, ProxyTimeoutError) as e:
+                if attempt < transient_retries:
+                    logger.debug(f"Proxy connection error, retrying: {e}")
+                    continue
+                return None, 0, CheckError("Proxy", str(e))
+            except http_exceptions.BadHttpMessage as e:
+                return None, 0, CheckError("HTTP", str(e))
+            except ProxyError as e:
+                return None, 0, CheckError("Proxy", str(e))
+            except ClientPayloadError as e:
+                if attempt < transient_retries:
+                    logger.debug(f"Payload error, retrying: {e}")
+                    continue
+                return None, 0, CheckError("Payload", str(e))
+            except KeyboardInterrupt:
+                return None, 0, CheckError("Interrupted")
+            except Exception as e:
+                if sys.version_info.minor > 6 and (
+                    isinstance(e, ssl.SSLCertVerificationError)
+                    or isinstance(e, ssl.SSLError)
+                ):
+                    return None, 0, CheckError("SSL", str(e))
                 else:
-                    kwargs['json'] = payload
-
-            async with request_method(**kwargs) as response:
-                status_code = response.status
-                response_content = await response.content.read()
-                charset = response.charset or "utf-8"
-                decoded_content = response_content.decode(charset, "ignore")
-
-                error = CheckError("Connection lost") if status_code == 0 else None
-                logger.debug(decoded_content)
-
-                return decoded_content, status_code, error
-
-        except asyncio.TimeoutError as e:
-            return None, 0, CheckError("Request timeout", str(e))
-        except ClientConnectorError as e:
-            return None, 0, CheckError("Connecting failure", str(e))
-        except ServerDisconnectedError as e:
-            return None, 0, CheckError("Server disconnected", str(e))
-        except http_exceptions.BadHttpMessage as e:
-            return None, 0, CheckError("HTTP", str(e))
-        except proxy_errors.ProxyError as e:
-            return None, 0, CheckError("Proxy", str(e))
-        except KeyboardInterrupt:
-            return None, 0, CheckError("Interrupted")
-        except Exception as e:
-            if sys.version_info.minor > 6 and (
-                isinstance(e, ssl.SSLCertVerificationError)
-                or isinstance(e, ssl.SSLError)
-            ):
-                return None, 0, CheckError("SSL", str(e))
-            else:
-                logger.debug(e, exc_info=True)
+                    logger.debug(e, exc_info=True)
                 return None, 0, CheckError("Unexpected", str(e))
 
     async def check(self) -> Tuple[Optional[str], int, Optional[CheckError]]:
@@ -144,16 +334,18 @@ class SimpleAiohttpChecker(CheckerBase):
         ssl_context.check_hostname = False
         ssl_context.verify_mode = ssl.CERT_NONE
 
-        connector = (
-            ProxyConnector.from_url(self.proxy)
-            if self.proxy
-            else TCPConnector(ssl=ssl_context)
-        )
+        # Build the TCPConnector with an explicit resolver when 'threaded' is
+        # requested. ProxyConnector takes its own resolver kwarg too, so apply
+        # the same setting on both code paths.
+        resolver = ThreadedResolver() if self.dns_resolver == 'threaded' else None
+        if self.proxy:
+            connector = ProxyConnector.from_url(self.proxy, resolver=resolver) if resolver else ProxyConnector.from_url(self.proxy)
+        else:
+            connector = TCPConnector(ssl=ssl_context, resolver=resolver) if resolver else TCPConnector(ssl=ssl_context)
 
         async with ClientSession(
             connector=connector,
             trust_env=True,
-            # TODO: tests
             cookie_jar=self.cookie_jar if self.cookie_jar else None,
         ) as session:
             html_text, status_code, error = await self._make_request(
@@ -174,10 +366,7 @@ class SimpleAiohttpChecker(CheckerBase):
 
 
 class ProxiedAiohttpChecker(SimpleAiohttpChecker):
-    def __init__(self, *args, **kwargs):
-        self.proxy = kwargs.get('proxy')
-        self.cookie_jar = kwargs.get('cookie_jar')
-        self.logger = kwargs.get('logger', Mock())
+    pass
 
 
 class AiodnsDomainResolver(CheckerBase):
@@ -185,11 +374,11 @@ class AiodnsDomainResolver(CheckerBase):
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
     def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
         loop = asyncio.get_event_loop()
-        self.logger = kwargs.get('logger', Mock())
         self.resolver = aiodns.DNSResolver(loop=loop)
 
-    def prepare(self, url, headers=None, allow_redirects=True, timeout=0, method='get', payload=None):
+    def prepare(self, url, headers=None, allow_redirects=True, timeout=0, method='get', payload=None, encoding=None):
         self.url = url
         return None
 
@@ -211,20 +400,127 @@ class AiodnsDomainResolver(CheckerBase):
         return text, status, error
 
 
-try:
-    from curl_cffi.requests import AsyncSession as CurlCffiAsyncSession
-
-    CURL_CFFI_AVAILABLE = True
-except ImportError:
-    CURL_CFFI_AVAILABLE = False
+from curl_cffi import CurlError
+from curl_cffi.requests import AsyncSession as CurlCffiAsyncSession
 
 
 class CurlCffiChecker(CheckerBase):
     """Checker using curl_cffi to emulate browser TLS fingerprint and bypass WAF."""
 
     def __init__(self, *args, **kwargs):
-        self.logger = kwargs.get('logger', Mock())
+        super().__init__(*args, **kwargs)
         self.browser_emulate = kwargs.get('browser_emulate', 'chrome')
+        self.proxy = normalize_proxy_scheme(kwargs.get('proxy'), LIBCURL_TRANSPORT)
+
+    def prepare(self, url, headers=None, allow_redirects=True, timeout=0, method='get', payload=None, encoding=None):
+        self.url = url
+        self.headers = headers
+        self.allow_redirects = allow_redirects
+        self.timeout = timeout
+        self.method = method
+        self.payload = payload
+        self.encoding = encoding
+        return None
+
+    async def close(self):
+        pass
+
+    async def check(self) -> Tuple[Optional[str], int, Optional[CheckError]]:
+        session_kwargs = {}
+        if self.proxy:
+            session_kwargs['proxies'] = {'http': self.proxy, 'https': self.proxy}
+
+        # Mirrors SimpleAiohttpChecker's payload-error retry: a rotating
+        # proxy's CONNECT tunnel occasionally 502s or drops the TLS
+        # handshake mid-way (curl_cffi surfaces both as CurlError — e.g.
+        # "curl: (56) CONNECT tunnel failed, response 502" or
+        # "curl: (35) TLS connect error"). One retry on a fresh connection
+        # is enough to usually land on a working exit node.
+        connect_retries = 1
+        for attempt in range(connect_retries + 1):
+            try:
+                async with CurlCffiAsyncSession(**session_kwargs) as session:
+                    # Strip the User-Agent so curl_cffi can use the impersonated browser's
+                    # matching UA. Mixing a random UA with a Chrome TLS fingerprint trips
+                    # composite bot scoring (e.g. Cloudflare returns a JS challenge for
+                    # "Chrome 91 UA + Chrome 131 TLS"). Keep any site-specific custom headers.
+                    headers = {k: v for k, v in (self.headers or {}).items()
+                               if k.lower() not in ('user-agent', 'connection')}
+                    kwargs = {
+                        'url': self.url,
+                        'headers': headers or None,
+                        'allow_redirects': self.allow_redirects,
+                        'timeout': self.timeout if self.timeout else 10,
+                        'impersonate': self.browser_emulate,
+                    }
+                    if self.payload and self.method.lower() == 'post':
+                        kwargs['json'] = self.payload
+
+                    if self.method.lower() == 'post':
+                        response = await session.post(**kwargs)
+                    elif self.method.lower() == 'head':
+                        response = await session.head(**kwargs)
+                    else:
+                        response = await session.get(**kwargs)
+
+                    status_code = response.status_code
+                    if self.encoding:
+                        response.encoding = self.encoding
+                    decoded_content = response.text
+
+                    self.logger.debug(decoded_content)
+
+                    error = CheckError("Connection lost") if status_code == 0 else None
+                    return decoded_content, status_code, error
+
+            except asyncio.TimeoutError as e:
+                return None, 0, CheckError("Request timeout", str(e))
+            except KeyboardInterrupt:
+                return None, 0, CheckError("Interrupted")
+            except CurlError as e:
+                if attempt < connect_retries:
+                    self.logger.debug(f"curl_cffi connection error, retrying: {e}")
+                    continue
+                return None, 0, CheckError("Connecting failure", str(e))
+            except Exception as e:
+                self.logger.debug(e, exc_info=True)
+                return None, 0, CheckError("Unexpected", str(e))
+
+
+class CloudflareWebgateChecker(CheckerBase):
+    """Sends checks through a Cloudflare-bypass proxy.
+
+    Supports two backends, selected by ``modules[0].method`` in settings:
+
+    - ``json_api`` (FlareSolverr): POST to ``/v1`` with ``cmd: request.get``.
+      Preserves real upstream status_code, headers and final URL — drop-in
+      replacement for SimpleAiohttpChecker.
+    - ``url_rewrite`` (CloudflareBypassForScraping ``/html`` endpoint):
+      legacy mode. Returns rendered HTML only. Real upstream status is
+      lost (proxy answers 200 on success). status_code / response_url
+      check types degrade to "200 if HTML returned, AVAILABLE otherwise".
+    """
+
+    SESSION_PREFIX_DEFAULT = "maigret"
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        config = kwargs.get('config') or {}
+        self._modules: List[Dict[str, Any]] = []
+        for raw in config.get('modules') or []:
+            module = dict(raw)
+            module.setdefault('method', 'json_api')
+            module.setdefault('name', module.get('method'))
+            self._modules.append(module)
+        if not self._modules:
+            raise ValueError("CloudflareWebgateChecker requires at least one module")
+        # Session ID is computed per-request from the target host. Sharing a
+        # single session across hosts caused FlareSolverr to break in
+        # practice (TLS state / cookies leaking between domains), so each
+        # host gets its own Chrome instance.
+        self._session_prefix = (
+            f"{config.get('session_prefix', self.SESSION_PREFIX_DEFAULT)}-{os.getpid()}"
+        )
         self.url = None
         self.headers = None
         self.allow_redirects = True
@@ -232,66 +528,200 @@ class CurlCffiChecker(CheckerBase):
         self.method = 'get'
         self.payload = None
 
-    def prepare(self, url, headers=None, allow_redirects=True, timeout=0, method='get', payload=None):
+    @property
+    def session_id(self) -> str:
+        """FlareSolverr session ID, scoped per target host."""
+        from urllib.parse import urlparse
+
+        host = urlparse(self.url or "").hostname or "default"
+        host_safe = re.sub(r"[^a-zA-Z0-9.-]", "_", host)
+        return f"{self._session_prefix}-{host_safe}"
+
+    def prepare(self, url, headers=None, allow_redirects=True, timeout=0, method='get', payload=None, encoding=None):
         self.url = url
-        self.headers = headers
+        self.headers = headers or {}
         self.allow_redirects = allow_redirects
         self.timeout = timeout
         self.method = method
         self.payload = payload
+        self.encoding = encoding
         return None
 
     async def close(self):
         pass
 
     async def check(self) -> Tuple[Optional[str], int, Optional[CheckError]]:
+        attempts: List[str] = []
+        last_error: Optional[CheckError] = None
+        for module in self._modules:
+            method = module.get('method')
+            module_name = module.get('name', method or '?')
+            if method == 'json_api':
+                result = await self._check_flaresolverr(module)
+            elif method == 'url_rewrite':
+                result = await self._check_url_rewrite(module)
+            else:
+                self.logger.warning(
+                    f"Webgate module '{module_name}' has unknown method "
+                    f"'{method}', skipping"
+                )
+                attempts.append(f"{module_name}:unknown-method")
+                continue
+            body, status, err = result
+            if err is None:
+                return result
+            last_error = err
+            attempts.append(f"{module_name}:{err.type}")
+            self.logger.info(
+                f"Webgate module '{module_name}' failed for {self.url}: "
+                f"{err.type}: {err.desc}. Trying next module if any."
+            )
+        # All modules failed. The most common case is "user opted into
+        # cloudflare_bypass but the solver isn't running" — every per-module
+        # attempt ends with "Webgate unreachable" (TCP refused / DNS fail at
+        # the configured URL). Detect that case and emit a clear, actionable
+        # message; fall back to a generic summary otherwise.
+        primary = self._modules[0]
+        primary_url = primary.get('url', '?')
+        primary_method = primary.get('method', '?')
+        start_hint = (
+            "docker run -d -p 8191:8191 ghcr.io/flaresolverr/flaresolverr:latest"
+            if primary_method == 'json_api'
+            else "start the local proxy container"
+        )
+        all_unreachable = bool(attempts) and all(
+            a.endswith(":Webgate unreachable") for a in attempts
+        )
+        if all_unreachable:
+            desc = (
+                "cloudflare_bypass is enabled (settings.json or "
+                f"--cloudflare-bypass), but the configured solver at "
+                f"{primary_url} is not reachable [{', '.join(attempts)}]. "
+                f"Either start the solver ({start_hint}) or disable "
+                "cloudflare_bypass in settings.json"
+            )
+        else:
+            last_desc = last_error.desc if last_error else "unknown"
+            desc = (
+                f"all {len(self._modules)} module(s) failed "
+                f"[{', '.join(attempts)}]. Last error: {last_desc}. "
+                f"Is the solver running at {primary_url}? (hint: {start_hint})"
+            )
+        return None, 0, CheckError("Webgate unavailable", desc)
+
+    async def _check_flaresolverr(
+        self, module: Dict[str, Any]
+    ) -> Tuple[Optional[str], int, Optional[CheckError]]:
+        endpoint = module.get('url') or 'http://localhost:8191/v1'
+        max_timeout_ms = int(module.get('max_timeout_ms', 60000))
+        post_method = self.method.lower() == 'post'
+        cmd = "request.post" if post_method else "request.get"
+
+        body: Dict[str, Any] = {
+            "cmd": cmd,
+            "url": self.url,
+            "maxTimeout": max_timeout_ms,
+            "session": self.session_id,
+        }
+
+        proxy = module.get('proxy')
+        if isinstance(proxy, str) and proxy:
+            body["proxy"] = {"url": proxy}
+        elif isinstance(proxy, dict) and proxy.get("url"):
+            body["proxy"] = {k: v for k, v in proxy.items() if k in ("url", "username", "password")}
+
+        if post_method and self.payload is not None:
+            # FlareSolverr expects postData as urlencoded string for form data,
+            # but if site.request_payload is JSON we still send it.
+            body["postData"] = (
+                "&".join(f"{k}={quote(str(v))}" for k, v in self.payload.items())
+            )
+
+        timeout = max(int(self.timeout) if self.timeout else 30, max_timeout_ms / 1000 + 5)
+
         try:
-            async with CurlCffiAsyncSession() as session:
-                # Strip the User-Agent so curl_cffi can use the impersonated browser's
-                # matching UA. Mixing a random UA with a Chrome TLS fingerprint trips
-                # composite bot scoring (e.g. Cloudflare returns a JS challenge for
-                # "Chrome 91 UA + Chrome 131 TLS"). Keep any site-specific custom headers.
-                headers = {k: v for k, v in (self.headers or {}).items()
-                           if k.lower() not in ('user-agent', 'connection')}
-                kwargs = {
-                    'url': self.url,
-                    'headers': headers or None,
-                    'allow_redirects': self.allow_redirects,
-                    'timeout': self.timeout if self.timeout else 10,
-                    'impersonate': self.browser_emulate,
-                }
-                if self.payload and self.method.lower() == 'post':
-                    kwargs['json'] = self.payload
-
-                if self.method.lower() == 'post':
-                    response = await session.post(**kwargs)
-                elif self.method.lower() == 'head':
-                    response = await session.head(**kwargs)
-                else:
-                    response = await session.get(**kwargs)
-
-                status_code = response.status_code
-                decoded_content = response.text
-
-                self.logger.debug(decoded_content)
-
-                error = CheckError("Connection lost") if status_code == 0 else None
-                return decoded_content, status_code, error
-
-        except asyncio.TimeoutError as e:
-            return None, 0, CheckError("Request timeout", str(e))
-        except KeyboardInterrupt:
-            return None, 0, CheckError("Interrupted")
+            async with ClientSession() as session:
+                async with session.post(
+                    endpoint, json=body, timeout=timeout
+                ) as resp:
+                    if resp.status >= 500:
+                        return None, 0, CheckError(
+                            "Webgate", f"FlareSolverr {resp.status}"
+                        )
+                    data = await resp.json()
+        except (ClientConnectorError, ServerDisconnectedError) as e:
+            return None, 0, CheckError("Webgate unreachable", str(e))
+        except asyncio.TimeoutError:
+            return None, 0, CheckError("Webgate timeout", endpoint)
         except Exception as e:
             self.logger.debug(e, exc_info=True)
-            return None, 0, CheckError("Unexpected", str(e))
+            return None, 0, CheckError("Webgate", str(e))
+
+        if data.get("status") != "ok":
+            return None, 0, CheckError("Webgate", data.get("message", "unknown"))
+
+        solution = data.get("solution") or {}
+        upstream_status = int(solution.get("status") or 0)
+        response_text = solution.get("response") or ""
+
+        # Diagnostic: warn if FlareSolverr returned the CF challenge page
+        # itself (challenge not fully solved) rather than the real content.
+        # When this happens with sites that have weak presenseStrs/absenceStrs,
+        # maigret's default-true presence rule produces false CLAIMED.
+        cf_markers = ("Just a moment", "_cf_chl_opt", "cf-mitigated", "challenges.cloudflare.com")
+        if response_text and any(m in response_text for m in cf_markers):
+            self.logger.warning(
+                f"Webgate response from {self.url} still contains CF challenge "
+                f"markers (status={upstream_status}, body={len(response_text)}b). "
+                f"FlareSolverr likely did not solve the challenge — site checks "
+                f"with weak markers may produce false CLAIMED."
+            )
+
+        self.logger.info(
+            f"Webgate response: url={self.url} status={upstream_status} "
+            f"body_len={len(response_text)}"
+        )
+        return response_text, upstream_status, None
+
+    async def _check_url_rewrite(
+        self, module: Dict[str, Any]
+    ) -> Tuple[Optional[str], int, Optional[CheckError]]:
+        url_template = module.get('url') or ''
+        if "{url}" not in url_template:
+            return None, 0, CheckError(
+                "Webgate", f"module '{module.get('name')}' url has no {{url}} placeholder"
+            )
+        from urllib.parse import quote_plus
+
+        proxy_url = url_template.format(url=quote_plus(self.url))
+        timeout = self.timeout if self.timeout else 30
+        try:
+            async with ClientSession() as session:
+                async with session.get(proxy_url, timeout=timeout) as resp:
+                    if resp.status >= 500:
+                        return None, 0, CheckError(
+                            "Webgate", f"url_rewrite proxy {resp.status}"
+                        )
+                    body = await resp.text()
+        except (ClientConnectorError, ServerDisconnectedError) as e:
+            return None, 0, CheckError("Webgate unreachable", str(e))
+        except asyncio.TimeoutError:
+            return None, 0, CheckError("Webgate timeout", proxy_url)
+        except Exception as e:
+            self.logger.debug(e, exc_info=True)
+            return None, 0, CheckError("Webgate", str(e))
+
+        # url_rewrite mode CANNOT recover the upstream HTTP status.
+        # We assume 200 when HTML is returned; status_code/response_url
+        # check types will misfire (see docs).
+        return body, 200, None
 
 
 class CheckerMock:
     def __init__(self, *args, **kwargs):
         pass
 
-    def prepare(self, url, headers=None, allow_redirects=True, timeout=0, method='get', payload=None):
+    def prepare(self, url, headers=None, allow_redirects=True, timeout=0, method='get', payload=None, encoding=None):
         return None
 
     async def check(self) -> Tuple[Optional[str], int, Optional[CheckError]]:
@@ -302,37 +732,15 @@ class CheckerMock:
         return
 
 
-# TODO: move to separate class
-def detect_error_page(
-    html_text, status_code, fail_flags, ignore_403
-) -> Optional[CheckError]:
-    # Detect service restrictions such as a country restriction
-    for flag, msg in fail_flags.items():
-        if flag in html_text:
-            return CheckError("Site-specific", msg)
-
-    # Detect common restrictions such as provider censorship and bot protection
-    err = errors.detect(html_text)
-    if err:
-        return err
-
-    # Detect common site errors
-    if status_code == 403 and not ignore_403:
-        return CheckError("Access denied", "403 status code, use proxy/vpn")
-
-    elif status_code == 999:
-        # LinkedIn anti-bot / HTTP 999 workaround. It shouldn't trigger an infrastructure
-        # Server Error because it represents a valid "Not Found / Blocked" state for the username.
-        pass
-
-    elif status_code >= 500:
-        return CheckError("Server", f"{status_code} status code")
-
-    return None
+def make_protocol_checker(options: Dict[str, Any], protocol: str):
+    checker_factory = options["checkers"][protocol]
+    if callable(checker_factory):
+        return checker_factory()
+    return checker_factory
 
 
 def debug_response_logging(url, html_text, status_code, check_error):
-    with open("debug.log", "a") as f:
+    with open("debug.log", "a", encoding="utf-8") as f:
         status = status_code or "No response"
         f.write(f"url: {url}\nerror: {check_error}\nr: {status}\n")
         if html_text:
@@ -340,7 +748,7 @@ def debug_response_logging(url, html_text, status_code, check_error):
 
 
 def process_site_result(
-    response, query_notify, logger, results_info: QueryResultWrapper, site: MaigretSite
+    response, query_notify, logger, results_info: SiteResult, site: MaigretSite
 ):
     if not response:
         return results_info
@@ -365,14 +773,8 @@ def process_site_result(
     # Get the expected check type
     check_type = site.check_type
 
-    # TODO: refactor
-    if not response:
-        logger.error(f"No response for {site.name}")
-        return results_info
-
     html_text, status_code, check_error = response
 
-    # TODO: add elapsed request time counting
     response_time = None
 
     if logger.level == logging.DEBUG:
@@ -381,35 +783,14 @@ def process_site_result(
     # additional check for errors
     if status_code and not check_error:
         check_error = detect_error_page(
-            html_text, status_code, site.errors_dict, site.ignore403
+            html_text,
+            status_code,
+            site.errors_dict,
+            site.ignore403,
         )
 
-    # parsing activation
-    is_need_activation = any(
-        [s for s in site.activation.get("marks", []) if s in html_text]
-    )
-
-    if site.activation and html_text and is_need_activation:
-        logger.debug(f"Activation for {site.name}")
-        method = site.activation["method"]
-        try:
-            activate_fun = getattr(ParsingActivator(), method)
-            # TODO: async call
-            activate_fun(site, logger)
-        except AttributeError as e:
-            logger.warning(
-                f"Activation method {method} for site {site.name} not found!",
-                exc_info=True,
-            )
-        except Exception as e:
-            logger.warning(
-                f"Failed activation {method} for site {site.name}: {str(e)}",
-                exc_info=True,
-            )
-        # TODO: temporary check error
-
     site_name = site.pretty_name
-    # presense flags
+    # presence flags
     # True by default
     presense_flags = site.presense_strs
     is_presense_detected = False
@@ -423,6 +804,18 @@ def process_site_result(
                     site.name,
                 )
             is_presense_detected = True
+            # #2633: When searching non-ASCII usernames (e.g. Chinese),
+            # a response that doesn't contain the username at all is likely
+            # a generic error/default page, not a valid profile hit.
+            if any(ord(c) > 127 for c in username):
+                if username not in html_text:
+                    logger.debug(
+                        "Site %s returned page without non-ASCII username '%s'; "
+                        "marking as not detected to avoid false positive.",
+                        site.name,
+                        username,
+                    )
+                    is_presense_detected = False
             site.stats["presense_flag"] = None
         else:
             for presense_flag in presense_flags:
@@ -432,6 +825,26 @@ def process_site_result(
                     logger.debug(presense_flag)
                     break
 
+
+    # Keyword detection logic
+    keywords = results_info.get("keywords", [])
+    keyword_match_status = None
+    
+    if keywords and html_text:
+        keywords_found = []
+        for keyword in keywords:
+            if keyword.lower() in html_text.lower():
+                keywords_found.append(keyword)
+        
+        if keywords_found:
+            keyword_match_status = KeywordMatchStatus.KEYWORD_FOUND
+            logger.debug(f"Keywords found in {site.name}: {keywords_found}")
+        else:
+            keyword_match_status = KeywordMatchStatus.KEYWORDS_NOT_FOUND
+            logger.debug(f"No keywords found in {site.name}")
+    else:
+        keyword_match_status = KeywordMatchStatus.NO_KEYWORDS
+
     def build_result(status, **kwargs):
         return MaigretCheckResult(
             username,
@@ -440,20 +853,17 @@ def process_site_result(
             status,
             query_time=response_time,
             tags=fulltags,
+            keywords=keywords,
+            keyword_match_status=keyword_match_status,
             **kwargs,
         )
 
     if check_error:
         logger.warning(check_error)
-        result = MaigretCheckResult(
-            username,
-            site_name,
-            url,
+        result = build_result(
             MaigretCheckStatus.UNKNOWN,
-            query_time=response_time,
             error=check_error,
-            context=str(CheckError),
-            tags=fulltags,
+            context=str(check_error),
         )
     elif check_type == "message":
         # Checks if the error message is in the HTML
@@ -509,13 +919,14 @@ def process_site_result(
 
 
 def make_site_result(
-    site: MaigretSite, username: str, options: QueryOptions, logger, *args, **kwargs
-) -> QueryResultWrapper:
-    results_site: QueryResultWrapper = {}
+    site: MaigretSite, username: str, options: Dict[str, Any], logger, *args, **kwargs
+) -> SiteResult:
+    results_site: SiteResult = {}
 
     # Record URL of main site and username
     results_site["site"] = site
     results_site["username"] = username
+    results_site["keywords"] = kwargs.get('keywords', [])
     results_site["parsing_enabled"] = options["parsing"]
     results_site["url_main"] = site.url_main
     results_site["cookies"] = (
@@ -547,21 +958,43 @@ def make_site_result(
     # workaround to prevent slash errors
     url = re.sub("(?<!:)/+", "/", url)
 
-    # Select checker: use curl_cffi for sites requiring TLS impersonation
+    # Select checker. Order of precedence:
+    # 1. Cloudflare webgate (FlareSolverr / CloudflareBypassForScraping) when
+    #    bypass is active and site.protection requests it.
+    # 2. curl_cffi for sites requiring TLS impersonation.
+    # 3. Default protocol-specific checker (aiohttp).
+    cf_bypass = options.get("cloudflare_bypass")
+    needs_webgate = bool(cf_bypass) and any(
+        p in cf_bypass["trigger_protection"] for p in site.protection
+    )
     needs_impersonation = 'tls_fingerprint' in site.protection
-    if needs_impersonation and CURL_CFFI_AVAILABLE:
-        checker = CurlCffiChecker(logger=logger, browser_emulate='chrome')
-    elif needs_impersonation and not CURL_CFFI_AVAILABLE:
-        logger.warning(
-            f"Site {site.name} requires TLS impersonation (curl_cffi) but it's not installed. "
-            "Install with: pip install curl_cffi"
-        )
-        checker = options["checkers"][site.protocol]
-    else:
-        checker = options["checkers"][site.protocol]
 
+    if needs_webgate:
+        checker = CloudflareWebgateChecker(logger=logger, config=cf_bypass)
+        logger.info(
+            f"Using Cloudflare webgate for {site.name} "
+            f"(protection: {list(site.protection)})"
+        )
+    elif needs_impersonation:
+        checker = CurlCffiChecker(
+            logger=logger,
+            browser_emulate='chrome',
+            proxy=options.get('proxy'),
+        )
+    else:
+        checker = make_protocol_checker(options, site.protocol)
+
+    if isinstance(checker, CheckerMock):
+        protocol = site.protocol or "protocol"
+        results_site["status"] = MaigretCheckResult(
+            username,
+            site.name,
+            url,
+            MaigretCheckStatus.ILLEGAL,
+            error=CheckError("Skipped", f"no {protocol} gateway configured"),
+        )
     # site check is disabled
-    if site.disabled and not options['forced']:
+    elif site.disabled and not options['forced']:
         logger.debug(f"Site {site.name} is disabled, skipping...")
         results_site["status"] = MaigretCheckResult(
             username,
@@ -604,10 +1037,13 @@ def make_site_result(
         else:
             # There is a special URL for probing existence separate
             # from where the user profile normally can be found.
+            # Encode the username here just like the display URL above does:
+            # a raw "#" otherwise turns the rest of it into a fragment and the
+            # probe silently lands on a different account's URL.
             url_probe = url_probe.format(
                 urlMain=site.url_main,
                 urlSubpath=site.url_subpath,
-                username=username,
+                username=quote(username),
             )
 
         for k, v in site.get_params.items():
@@ -654,6 +1090,7 @@ def make_site_result(
             allow_redirects=allow_redirects,
             timeout=options['timeout'],
             payload=payload,
+            encoding=site.encoding,
         )
 
         # Store future request object in the results object
@@ -665,11 +1102,16 @@ def make_site_result(
 
 
 async def check_site_for_username(
-    site, username, options: QueryOptions, logger, query_notify, *args, **kwargs
-) -> Tuple[str, QueryResultWrapper]:
+    site, username, options: Dict[str, Any], logger, query_notify, *args, **kwargs
+) -> Tuple[str, SiteResult]:
+    keywords = kwargs.get('keywords')
     default_result = make_site_result(
-        site, username, options, logger, retry=kwargs.get('retry')
+        site, username, options, logger, retry=kwargs.get('retry'), keywords=keywords
     )
+    if default_result.get("status"):
+        query_notify.update(default_result["status"], site.similar_search)
+        return site.name, default_result
+
     # future = default_result.get("future")
     # if not future:
     # return site.name, default_result
@@ -690,8 +1132,14 @@ async def check_site_for_username(
             method = act["method"]
             try:
                 activate_fun = getattr(ParsingActivator(), method)
-                activate_fun(site, logger, url=checker.url)
-            except AttributeError as e:
+                await activate_fun(
+                    site,
+                    logger,
+                    url=checker.url,
+                    timeout=options['timeout'],
+                    html=html_text,
+                )
+            except AttributeError:
                 logger.warning(
                     f"Activation method {method} for site {site.name} not found!",
                     exc_info=True,
@@ -711,12 +1159,27 @@ async def check_site_for_username(
                     timeout=checker.timeout,
                     method=checker.method,
                     payload=getattr(checker, 'payload', None),
+                    encoding=site.encoding,
                 )
                 response = await checker.check()
 
     response_result = process_site_result(
         response, query_notify, logger, default_result, site
     )
+
+    if (
+        options.get('enrich')
+        and response_result.get('status')
+        and response_result['status'].status == MaigretCheckStatus.CLAIMED
+    ):
+        await run_url_mutations(
+            checker=checker,
+            site=site,
+            results_info=response_result,
+            options=options,
+            logger=logger,
+            query_notify=query_notify,
+        )
 
     query_notify.update(response_result['status'], site.similar_search)
 
@@ -732,10 +1195,10 @@ async def debug_ip_request(checker, logger):
         logger.debug(f"IP requesting {check_error.type}: {check_error.desc}")
 
 
-def get_failed_sites(results: Dict[str, QueryResultWrapper]) -> List[str]:
+def get_failed_sites(results: Dict[str, SiteResult]) -> List[str]:
     sites = []
     for sitename, r in results.items():
-        status = r.get('status', {})
+        status = r.get('status')
         if status and status.error:
             if errors.is_permanent(status.error.type):
                 continue
@@ -753,6 +1216,7 @@ async def maigret(
     i2p_proxy=None,
     timeout=3,
     is_parsing_enabled=False,
+    is_enrich_enabled=False,
     id_type="username",
     debug=False,
     forced=False,
@@ -761,9 +1225,13 @@ async def maigret(
     cookies=None,
     retries=0,
     check_domains=False,
+    cloudflare_bypass: Optional[Dict[str, Any]] = None,
+    keywords=None,
+    dns_resolver: str = 'async',
+    output_container: Optional[Dict[str, SiteResult]] = None,
     *args,
     **kwargs,
-) -> QueryResultWrapper:
+) -> Dict[str, SiteResult]:
     """Main search func
 
     Checks for existence of username on certain sites.
@@ -771,9 +1239,8 @@ async def maigret(
     Keyword Arguments:
     username               -- Username string will be used for search.
     site_dict              -- Dictionary containing sites data in MaigretSite objects.
-    query_notify           -- Object with base type of QueryNotify().
-                              This will be used to notify the caller about
-                              query results.
+    query_notify           -- Notifier object (e.g. QueryNotifyPrint) used to
+                              report query progress and results.
     logger                 -- Standard Python logger object.
     timeout                -- Time in seconds to wait before timing out request.
                               Default is 3 seconds.
@@ -785,6 +1252,9 @@ async def maigret(
                               Default is 100.
     no_progressbar         -- Displaying of ASCII progressbar during scanner.
     cookies                -- Filename of a cookie jar file to use for each request.
+    keywords               -- List of keywords to search for in HTML content.
+                              Default is None.
+    *args, **kwargs        -- Additional arguments.
 
     Return Value:
     Dictionary containing results from report. Key of dictionary is the name
@@ -811,31 +1281,32 @@ async def maigret(
         logger.debug(f"Using cookies jar file {cookies}")
         cookie_jar = import_aiohttp_cookies(cookies)
 
-    clearweb_checker = SimpleAiohttpChecker(
-        proxy=proxy, cookie_jar=cookie_jar, logger=logger
-    )
-
-    # TODO
-    tor_checker = CheckerMock()
-    if tor_proxy:
-        tor_checker = ProxiedAiohttpChecker(  # type: ignore
-            proxy=tor_proxy, cookie_jar=cookie_jar, logger=logger
+    def clearweb_checker():
+        return SimpleAiohttpChecker(
+            proxy=proxy, cookie_jar=cookie_jar, logger=logger, dns_resolver=dns_resolver
         )
 
-    # TODO
-    i2p_checker = CheckerMock()
-    if i2p_proxy:
-        i2p_checker = ProxiedAiohttpChecker(  # type: ignore
-            proxy=i2p_proxy, cookie_jar=cookie_jar, logger=logger
+    def tor_checker():
+        if not tor_proxy:
+            return CheckerMock()
+        return ProxiedAiohttpChecker(  # type: ignore
+            proxy=tor_proxy, cookie_jar=cookie_jar, logger=logger, dns_resolver=dns_resolver
         )
 
-    # TODO
-    dns_checker = CheckerMock()
-    if check_domains:
-        dns_checker = AiodnsDomainResolver(logger=logger)  # type: ignore
+    def i2p_checker():
+        if not i2p_proxy:
+            return CheckerMock()
+        return ProxiedAiohttpChecker(  # type: ignore
+            proxy=i2p_proxy, cookie_jar=cookie_jar, logger=logger, dns_resolver=dns_resolver
+        )
+
+    def dns_checker():
+        if not check_domains:
+            return CheckerMock()
+        return AiodnsDomainResolver(logger=logger)  # type: ignore
 
     if logger.level == logging.DEBUG:
-        await debug_ip_request(clearweb_checker, logger)
+        await debug_ip_request(clearweb_checker(), logger)
 
     # setup parallel executor
     executor = AsyncioQueueGeneratorExecutor(
@@ -847,7 +1318,7 @@ async def maigret(
     )
 
     # make options objects for all the requests
-    options: QueryOptions = {}
+    options: Dict[str, Any] = {}
     options["cookies"] = cookie_jar
     options["checkers"] = {
         '': clearweb_checker,
@@ -856,12 +1327,21 @@ async def maigret(
         'i2p': i2p_checker,
     }
     options["parsing"] = is_parsing_enabled
+    options["enrich"] = is_enrich_enabled
+    options["enrich_requests"] = 0
     options["timeout"] = timeout
     options["id_type"] = id_type
     options["forced"] = forced
+    options["cloudflare_bypass"] = cloudflare_bypass
+    options["proxy"] = proxy
 
     # results from analysis of all sites
-    all_results: Dict[str, QueryResultWrapper] = {}
+    # When the caller wants to read partial results after a Ctrl+C
+    # cancellation, they pass a dict; we mutate it in place so the partial
+    # state remains visible after this coroutine raises CancelledError.
+    all_results: Dict[str, SiteResult] = (
+        output_container if output_container is not None else {}
+    )
 
     sites = list(site_dict.keys())
 
@@ -872,7 +1352,7 @@ async def maigret(
         for sitename, site in site_dict.items():
             if sitename not in sites:
                 continue
-            default_result: QueryResultWrapper = {
+            default_result: SiteResult = {
                 'site': site,
                 'status': MaigretCheckResult(
                     username,
@@ -888,16 +1368,40 @@ async def maigret(
                 {
                     'default': (sitename, default_result),
                     'retry': retries - attempts + 1,
+                    'keywords': keywords,
                 },
             )
 
         cur_results = []
-        with alive_bar(
-            len(tasks_dict), title="Searching", force_tty=True, disable=no_progressbar
-        ) as progress:
-            async for result in executor.run(list(tasks_dict.values())):  # type: ignore[arg-type]
-                cur_results.append(result)
-                progress()
+        # ctrl_c=False is critical: alive_progress's default Ctrl+C handler
+        # silently absorbs the first SIGINT (it draws a "⚠" mark on the bar
+        # and keeps going), so the user has to press it twice. With
+        # ctrl_c=False the signal propagates immediately to asyncio, which
+        # cancels the main task — caught in maigret.maigret.main() as
+        # CancelledError so the search loop falls through to report
+        # generation. See issue: "ctrl+c needs two presses + traceback".
+        try:
+            with alive_bar(
+                len(tasks_dict), title="Searching", force_tty=True,
+                disable=no_progressbar, ctrl_c=False, enrich_print=False,
+            ) as progress:
+                async for result in executor.run(list(tasks_dict.values())):  # type: ignore[arg-type]
+                    cur_results.append(result)
+                    # `all_results` may be an output container supplied by
+                    # the caller — flush each completed site check into it
+                    # immediately, so partial progress survives a Ctrl+C
+                    # cancellation (issue #2688 follow-up). dict.update
+                    # accepts an iterable of (k, v) 2-tuples, which is what
+                    # the executor yields, so this is equivalent to the
+                    # post-loop update but visible to the caller mid-flight.
+                    all_results.update([result])
+                    progress()
+        except asyncio.CancelledError:
+            # Re-raise so the caller's `except CancelledError` runs. The
+            # partial `all_results` is already visible to the caller via the
+            # output_container kwarg.
+            query_notify.finish()
+            raise
 
         all_results.update(cur_results)
 
@@ -913,13 +1417,11 @@ async def maigret(
                 f'Restarting checks for {len(sites)} sites... ({attempts} attempts left)'
             )
 
-    # closing http client session
-    await clearweb_checker.close()
-    await tor_checker.close()
-    await i2p_checker.close()
-
     # notify caller that all queries are finished
     query_notify.finish()
+
+    if is_enrich_enabled:
+        query_notify.enrich(f"{options.get('enrich_requests', 0)} extra requests performed")
 
     return all_results
 
@@ -962,6 +1464,8 @@ async def site_self_check(
     cookies=None,
     auto_disable=False,
     diagnose=False,
+    cloudflare_bypass: Optional[Dict[str, Any]] = None,
+    dns_resolver: str = 'async',
 ):
     """
     Self-check a site configuration.
@@ -1002,10 +1506,11 @@ async def site_self_check(
                     tor_proxy=tor_proxy,
                     i2p_proxy=i2p_proxy,
                     cookies=cookies,
+                    cloudflare_bypass=cloudflare_bypass,
+                    dns_resolver=dns_resolver,
                 )
 
                 # don't disable entries with other ids types
-                # TODO: make normal checking
                 if site.name not in results_dict:
                     logger.info(results_dict)
                     changes["issues"].append(f"Site {site.name} not in results (wrong id_type?)")
@@ -1130,6 +1635,8 @@ async def self_check(
     auto_disable=False,
     diagnose=False,
     no_progressbar=False,
+    cloudflare_bypass: Optional[Dict[str, Any]] = None,
+    dns_resolver: str = 'async',
 ) -> dict:
     """
     Run self-check on sites.
@@ -1158,13 +1665,16 @@ async def self_check(
     for _, site in all_sites.items():
         check_coro = site_self_check(
             site, logger, sem, db, silent, proxy, tor_proxy, i2p_proxy,
-            skip_errors=True, auto_disable=auto_disable, diagnose=diagnose
+            skip_errors=True, auto_disable=auto_disable, diagnose=diagnose,
+            cloudflare_bypass=cloudflare_bypass,
+            dns_resolver=dns_resolver,
         )
         future = asyncio.ensure_future(check_coro)
         tasks.append((site.name, future))
 
     if tasks:
-        with alive_bar(len(tasks), title='Self-checking', force_tty=True, disable=no_progressbar) as progress:
+        with alive_bar(len(tasks), title='Self-checking', force_tty=True,
+                       disable=no_progressbar, ctrl_c=False, enrich_print=False) as progress:
             for site_name, f in tasks:
                 try:
                     result = await f
@@ -1228,20 +1738,198 @@ def extract_ids_data(html_text, logger, site) -> Dict:
         return {}
 
 
+MAX_MUTATIONS_PER_SITE = 3
+
+
+def _domain_tail(host: str) -> str:
+    parts = (host or "").rsplit(".", 2)
+    return ".".join(parts[-2:]) if len(parts) >= 2 else host
+
+
+def _canonical_url(url: str) -> tuple:
+    p = urlparse(url or "")
+    return (p.scheme.lower(), p.netloc.lower(), p.path.rstrip("/").lower())
+
+
+async def run_url_mutations(checker, site, results_info, options, logger, query_notify=None) -> None:
+    """Fetch secondary URLs derived from the profile URL via socid_extractor's
+    url_mutations and merge extracted fields into results_info.
+
+    Reuses the site's already-configured checker (transport, proxy, cookies,
+    TLS impersonation). Never raises: a failing mutation must not sink the
+    primary CLAIMED result.
+    """
+    base_url = results_info.get("url_user")
+    if not base_url:
+        return
+
+    try:
+        mutations = list(mutate_url(base_url))
+    except Exception as e:
+        logger.debug(f"mutate_url failed for {site.name}: {e}", exc_info=True)
+        return
+
+    if not mutations:
+        return
+
+    # Drop mutations whose target domain differs from the site's own:
+    # mutate_url uses unanchored re.search, so a URL embedded in a query param
+    # can match a foreign scheme.
+    site_host = (
+        (urlparse(base_url).hostname or "")
+        or (urlparse(site.url_main or "").hostname or "")
+    ).lower()
+    site_tail = _domain_tail(site_host)
+    if site_tail and "." in site_tail:
+        onsite = [(u, h) for u, h in mutations
+                  if _domain_tail((urlparse(u).hostname or "").lower()) == site_tail]
+        if len(onsite) != len(mutations) and query_notify is not None:
+            query_notify.enrich(
+                f"{site.name}: skip {len(mutations) - len(onsite)} mutation(s) "
+                f"— cross-site (site domain {site_tail})",
+                verbose_only=True,
+            )
+        mutations = onsite
+    if not mutations:
+        return
+
+    # Drop mutations that would re-fetch the same URL Maigret already probed
+    # (compared by scheme+host+path, ignoring query string and trailing slash).
+    already_fetched = results_info.get("url_probe")
+    if already_fetched:
+        probe_canon = _canonical_url(already_fetched)
+        deduped = [(u, h) for u, h in mutations if _canonical_url(u) != probe_canon]
+        if len(deduped) != len(mutations) and query_notify is not None:
+            query_notify.enrich(
+                f"{site.name}: skip {len(mutations) - len(deduped)} mutation(s) "
+                f"— maigret has built-in check for this mutation",
+                verbose_only=True,
+            )
+        mutations = deduped
+    if not mutations:
+        return
+
+    if len(mutations) > MAX_MUTATIONS_PER_SITE:
+        logger.debug(
+            f"{site.name}: {len(mutations)} mutations, capping at "
+            f"{MAX_MUTATIONS_PER_SITE}"
+        )
+        mutations = mutations[:MAX_MUTATIONS_PER_SITE]
+
+    result = results_info.get("status")
+    if result is None:
+        return
+    if result.ids_data is None:
+        result.ids_data = {}
+
+    def notify(msg, verbose_only=False):
+        if query_notify is not None:
+            query_notify.enrich(msg, verbose_only=verbose_only)
+
+    for mut_url, mut_headers in mutations:
+        try:
+            headers = dict(checker.headers or {})
+            headers.update(site.headers or {})
+            headers.update(mut_headers or {})
+            # Mutations are always GET without a body: drop body-only headers
+            # that would otherwise be inherited from the site's base check.
+            for h in ("Content-Type", "Content-Length"):
+                headers.pop(h, None)
+
+            checker.prepare(
+                url=mut_url,
+                headers=headers,
+                allow_redirects=True,
+                timeout=checker.timeout,
+                method='get',
+                encoding=site.encoding,
+            )
+            options["enrich_requests"] = options.get("enrich_requests", 0) + 1
+            html_text, status_code, err = await checker.check()
+            if err:
+                notify(f"{site.name}: {mut_url} → error: {err}", verbose_only=True)
+                continue
+            if not html_text:
+                notify(
+                    f"{site.name}: {mut_url} → status={status_code}, empty body",
+                    verbose_only=True,
+                )
+                continue
+
+            extra = extract_ids_data(html_text, logger, site)
+            if not extra:
+                notify(
+                    f"{site.name}: {mut_url} → status={status_code}, "
+                    f"no socid_extractor scheme matched ({len(html_text)}B body)",
+                    verbose_only=True,
+                )
+                continue
+
+            # мутация дополняет, а не переопределяет — сохраняем поля от основной страницы
+            new_field_keys = []
+            for k, v in extra.items():
+                if k not in result.ids_data:
+                    result.ids_data[k] = v
+                    new_field_keys.append(k)
+
+            new_usernames = parse_usernames(extra, logger)
+            prev_usernames = results_info.get("ids_usernames") or {}
+            merged_usernames = dict(prev_usernames)
+            new_username_keys = []
+            for k, v in new_usernames.items():
+                if k not in merged_usernames:
+                    merged_usernames[k] = v
+                    new_username_keys.append(k)
+            results_info["ids_usernames"] = merged_usernames
+
+            extra_links = ascii_data_display(extra.get("links", "[]"))
+            if "website" in extra:
+                extra_links.append(extra["website"])
+            merged_links = list(results_info.get("ids_links") or [])
+            new_links = []
+            for link in extra_links:
+                if link not in merged_links:
+                    merged_links.append(link)
+                    new_links.append(link)
+            results_info["ids_links"] = merged_links
+
+            if not (new_field_keys or new_username_keys or new_links):
+                notify(
+                    f"{site.name}: enrich returned no new data via {mut_url}",
+                    verbose_only=True,
+                )
+        except Exception as e:
+            notify(f"{site.name}: {mut_url} → exception: {e}", verbose_only=True)
+            logger.warning(
+                f"URL mutation {mut_url} failed for {site.name}: {e}",
+                exc_info=True,
+            )
+
+
 def parse_usernames(extracted_ids_data, logger) -> Dict:
     new_usernames = {}
     for k, v in extracted_ids_data.items():
         if "username" in k and not "usernames" in k:
-            new_usernames[v] = "username"
+            if is_plausible_username(v):
+                new_usernames[v] = "username"
+            else:
+                logger.debug(
+                    f"Rejected non-username value extracted under key {k!r}: {v!r}"
+                )
         elif "usernames" in k:
             try:
                 tree = ast.literal_eval(v)
                 if isinstance(tree, list):
                     for n in tree:
-                        new_usernames[n] = "username"
+                        if is_plausible_username(n):
+                            new_usernames[n] = "username"
+                        else:
+                            logger.debug(
+                                f"Rejected non-username item from list under key {k!r}: {n!r}"
+                            )
             except Exception as e:
                 logger.warning(e)
-        if k in SUPPORTED_IDS:
+        elif k in SUPPORTED_IDS:
             new_usernames[v] = k
     return new_usernames
 

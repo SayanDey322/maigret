@@ -4,55 +4,119 @@ import argparse
 import hashlib
 import json
 import os.path as path
-import sys
 from datetime import datetime, timezone
+from typing import Optional, Tuple
 
 RESOURCES_DIR = path.join(path.dirname(path.dirname(path.abspath(__file__))), "maigret", "resources")
 DATA_JSON_PATH = path.join(RESOURCES_DIR, "data.json")
 META_JSON_PATH = path.join(RESOURCES_DIR, "db_meta.json")
 DEFAULT_DATA_URL = "https://raw.githubusercontent.com/soxoj/maigret/main/maigret/resources/data.json"
 
+# Backward-compatibility floor: the first maigret version that shipped the db_meta
+# auto-update mechanism (data format "version": 1). min_maigret_version must NOT
+# track the current release — it only rises when a breaking data-format change
+# genuinely requires a newer client. Used as the fallback when no db_meta.json
+# exists yet to read the value from.
+DEFAULT_MIN_VERSION = "0.5.0"
 
-def get_current_version():
-    version_file = path.join(path.dirname(path.dirname(path.abspath(__file__))), "maigret", "__version__.py")
-    with open(version_file) as f:
-        for line in f:
-            if line.startswith("__version__"):
-                return line.split("=")[1].strip().strip("'\"")
-    return "0.0.0"
+_TIMESTAMP_KEY = "updated_at"
+
+
+def build_meta(data_path: str, min_version: str, data_url: str, now: Optional[datetime] = None) -> dict:
+    """Build a db_meta dict for the given data.json. Does not touch the filesystem."""
+    with open(data_path, "rb") as f:
+        raw = f.read()
+    data = json.loads(raw)
+    ts = (now or datetime.now(timezone.utc)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return {
+        "version": 1,
+        _TIMESTAMP_KEY: ts,
+        "sites_count": len(data.get("sites", {})),
+        "min_maigret_version": min_version,
+        "data_sha256": hashlib.sha256(raw).hexdigest(),
+        "data_url": data_url,
+    }
+
+
+def meta_payload_equals(a: dict, b: dict) -> bool:
+    """Compare two db_meta dicts ignoring the volatile 'updated_at' field."""
+    a_clean = {k: v for k, v in a.items() if k != _TIMESTAMP_KEY}
+    b_clean = {k: v for k, v in b.items() if k != _TIMESTAMP_KEY}
+    return a_clean == b_clean
+
+
+def _read_meta(meta_path: str) -> Optional[dict]:
+    try:
+        with open(meta_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def write_meta_if_changed(
+    data_path: str,
+    meta_path: str,
+    min_version: str,
+    data_url: str,
+    now: Optional[datetime] = None,
+) -> Tuple[dict, bool]:
+    """Generate db_meta.json next to data.json. Skip the write entirely if
+    the only thing that would change is `updated_at` — keeps the file (and
+    git/precommit hooks) quiet when the underlying site database hasn't
+    actually moved.
+
+    Returns the meta dict that *would* be written and a bool indicating
+    whether a write happened.
+    """
+    new_meta = build_meta(data_path, min_version, data_url, now=now)
+    existing = _read_meta(meta_path)
+    if existing is not None and meta_payload_equals(existing, new_meta):
+        return existing, False
+
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(new_meta, f, indent=4, ensure_ascii=False)
+    return new_meta, True
+
+
+def resolve_min_version(cli_min_version: Optional[str], meta_path: str) -> str:
+    """Resolve the min_maigret_version to write.
+
+    Priority: explicit CLI value > value already in db_meta.json > DEFAULT_MIN_VERSION.
+    Crucially this does NOT fall back to the current release version, so routine
+    regenerations (e.g. after a version bump) never silently raise the compatibility
+    floor. It only moves when a maintainer passes --min-version for a real
+    data-format change.
+    """
+    if cli_min_version:
+        return cli_min_version
+    existing = _read_meta(meta_path)
+    if existing and existing.get("min_maigret_version"):
+        return existing["min_maigret_version"]
+    return DEFAULT_MIN_VERSION
 
 
 def main():
     parser = argparse.ArgumentParser(description="Generate db_meta.json from data.json")
-    parser.add_argument("--min-version", default=None, help="Minimum compatible maigret version (default: current version)")
+    parser.add_argument(
+        "--min-version",
+        default=None,
+        help="Minimum compatible maigret version. Default: preserve the value already "
+        f"in db_meta.json, or {DEFAULT_MIN_VERSION} if none exists. Do NOT let this track "
+        "the release version — only raise it on a breaking data-format change.",
+    )
     parser.add_argument("--data-url", default=DEFAULT_DATA_URL, help="URL where data.json can be downloaded")
     args = parser.parse_args()
 
-    min_version = args.min_version or get_current_version()
+    min_version = resolve_min_version(args.min_version, META_JSON_PATH)
+    meta, written = write_meta_if_changed(DATA_JSON_PATH, META_JSON_PATH, min_version, args.data_url)
 
-    with open(DATA_JSON_PATH, "rb") as f:
-        raw = f.read()
-        sha256 = hashlib.sha256(raw).hexdigest()
-
-    data = json.loads(raw)
-    sites_count = len(data.get("sites", {}))
-
-    meta = {
-        "version": 1,
-        "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "sites_count": sites_count,
-        "min_maigret_version": min_version,
-        "data_sha256": sha256,
-        "data_url": args.data_url,
-    }
-
-    with open(META_JSON_PATH, "w", encoding="utf-8") as f:
-        json.dump(meta, f, indent=4, ensure_ascii=False)
-
-    print(f"Generated {META_JSON_PATH}")
-    print(f"  sites: {sites_count}")
-    print(f"  sha256: {sha256[:16]}...")
-    print(f"  min_version: {min_version}")
+    if written:
+        print(f"Generated {META_JSON_PATH}")
+    else:
+        print(f"Skipped {META_JSON_PATH}: nothing changed except timestamp")
+    print(f"  sites: {meta['sites_count']}")
+    print(f"  sha256: {meta['data_sha256'][:16]}...")
+    print(f"  min_version: {meta['min_maigret_version']}")
 
 
 if __name__ == "__main__":

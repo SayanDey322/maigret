@@ -17,6 +17,9 @@ After start Maigret tries to load configuration from the following sources in ex
   # relative path, based on installed package path
   resources/settings.json
 
+  # absolute path, system-wide policy set by an administrator
+  /etc/maigret/settings.json
+
   # absolute path, configuration file in home directory
   ~/.maigret/settings.json
 
@@ -25,7 +28,7 @@ After start Maigret tries to load configuration from the following sources in ex
 
 Missing any of these files is not an error.
 If the next settings file contains already known option,
-this option will be rewrited. So it is possible to make
+this option will be rewritten. So it is possible to make
 custom configuration for different users and directories.
 
 .. _database-auto-update:
@@ -101,3 +104,197 @@ This is recommended for **Docker containers**, **CI pipelines**, and **air-gappe
      - URL of the metadata file (for custom mirrors)
 
 **Using a custom database** with ``--db`` always skips auto-update — you are explicitly choosing your data source.
+
+.. _activation-token-cache:
+
+Activation token cache
+----------------------
+
+A handful of sites reject anonymous requests until a short-lived token is obtained: Twitter needs a guest token, Vimeo a JWT, Weibo and Wikimapia a session cookie, OnlyFans a signed header pair, ProtonMail a bearer token. Maigret mints these during a run, the first time such a site answers with a challenge instead of a profile page.
+
+Minted values are cached in:
+
+.. code-block:: console
+
+   ~/.maigret/activation.json
+
+so the next run starts with a warm token and skips the extra round trip. The file is created with ``0600`` permissions because these tokens are session credentials — treat it as one, and do not attach it to a bug report.
+
+**What is stored:** only the header values that differ from what the site database shipped. Storing the whole header set would pin the shipped values, so a later database update could never change them again.
+
+**Safe to delete:** yes. The next run mints whatever it needs again; the only cost is one extra request per affected site.
+
+**Why it is not kept in the site database:** the database is package data. It is versioned, checksum-verified and replaced wholesale by :ref:`database-auto-update`, and on a system-wide install (distribution package, snap, ``/nix/store``) its directory is not writable at all. Tokens are per-user state with a different lifetime, so they live in a separate file.
+
+Cloudflare webgate
+------------------
+
+.. warning::
+
+   **Experimental.** The ``cloudflare_bypass`` block is under active
+   development; field names, defaults, and the trigger-protection routing
+   rules may change without backwards-compatibility guarantees.
+
+The ``cloudflare_bypass`` block in ``settings.json`` configures the optional
+bypass described in :ref:`cloudflare-bypass`. The same block is honoured by
+the CLI, the Python API, and the web UI (``python -m maigret.web.app``); set
+``enabled: true`` once and every entry point routes cf-protected sites
+through the solver.
+
+**Minimal FlareSolverr setup.** Start the solver in Docker, then drop the
+following snippet into ``~/.maigret/settings.json`` (or any path listed in
+:ref:`settings`):
+
+.. code-block:: bash
+
+   docker run -d -p 8191:8191 --name flaresolverr \
+       ghcr.io/flaresolverr/flaresolverr:latest
+
+.. code-block:: json
+
+   {
+       "cloudflare_bypass": {
+           "enabled": true,
+           "modules": [
+               {
+                   "name": "flaresolverr",
+                   "method": "json_api",
+                   "url": "http://localhost:8191/v1",
+                   "max_timeout_ms": 60000
+               }
+           ]
+       }
+   }
+
+That is enough — ``session_prefix`` and ``trigger_protection`` fall back to
+sensible defaults (``"maigret"`` and
+``["cf_js_challenge", "cf_firewall", "webgate"]`` respectively). On the next
+run, Maigret logs ``Cloudflare webgate active: ...`` and routes matching
+sites through the solver.
+
+Default value (full schema with every supported field):
+
+.. code-block:: json
+
+   {
+       "cloudflare_bypass": {
+           "enabled": false,
+           "session_prefix": "maigret",
+           "trigger_protection": ["cf_js_challenge", "cf_firewall", "webgate"],
+           "modules": [
+               {
+                   "name": "flaresolverr",
+                   "method": "json_api",
+                   "url": "http://localhost:8191/v1",
+                   "max_timeout_ms": 60000
+               },
+               {
+                   "name": "chrome_webgate",
+                   "method": "url_rewrite",
+                   "url": "http://localhost:8000/html?url={url}&retries=1"
+               }
+           ]
+       }
+   }
+
+**Fields.**
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 70
+
+   * - Field
+     - Description
+   * - ``enabled``
+     - When ``true``, the bypass is active for every run; when ``false``
+       (the default), it activates only on ``--cloudflare-bypass``.
+   * - ``trigger_protection``
+     - List of ``site.protection`` values that route a check through the
+       webgate. Sites whose protection is empty or doesn't intersect this
+       list use the default (aiohttp / curl_cffi) checker.
+   * - ``session_prefix``
+     - Prefix for the FlareSolverr ``session`` field. Maigret appends the
+       process PID so concurrent runs don't collide. Reusing a session
+       caches cf_clearance between checks of the same domain.
+   * - ``modules``
+     - Ordered list of backend modules. The first reachable module
+       handles the check; later ones serve as a fallback chain.
+
+**Module methods.**
+
+* ``json_api`` — FlareSolverr-compatible POST endpoint at ``url``.
+  Preserves real upstream HTTP status, headers and final URL.
+  Optional ``max_timeout_ms`` (default ``60000``) is the per-request
+  budget the solver is allowed to spend on the JS challenge.
+* ``url_rewrite`` — legacy CloudflareBypassForScraping endpoint. The
+  ``url`` must contain a ``{url}`` placeholder; the original probe URL
+  is URL-encoded and substituted in. Returns rendered HTML only —
+  ``checkType: status_code`` and ``response_url`` checks misfire under
+  this method (treated as a synthetic HTTP 200 on success).
+
+**Optional ``proxy`` field (``json_api`` only).**
+
+A module may carry a ``proxy`` entry that the solver routes the upstream
+request through. Useful when a site enforces ``ip_reputation`` rules
+that block the solver host. Two forms are accepted:
+
+.. code-block:: json
+
+   { "proxy": "socks5://localhost:1080" }
+
+.. code-block:: json
+
+   { "proxy": { "url": "http://gw.example:3128",
+                "username": "u",
+                "password": "p" } }
+
+Only ``url``/``username``/``password`` are forwarded; other keys are
+dropped. Cloudflare ``Error 1015 / 1020`` responses indicate the IP is
+rate-limited or banned — switch the proxy rather than retrying.
+.. _ai-analysis-settings:
+
+AI analysis
+-----------
+
+The ``--ai`` flag (see :ref:`ai-analysis`) talks to an OpenAI-compatible
+chat completion API. Three settings control how that request is made:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 35 25 40
+
+   * - Setting
+     - Default
+     - Description
+   * - ``openai_api_key``
+     - ``""`` (empty)
+     - API key. If empty, Maigret falls back to the ``OPENAI_API_KEY``
+       environment variable.
+   * - ``openai_model``
+     - ``gpt-4o``
+     - Default model name. Overridable per-run with ``--ai-model``.
+   * - ``openai_api_base_url``
+     - ``https://api.openai.com/v1``
+     - Base URL of the chat completion API. Point this at any
+       OpenAI-compatible service (Azure OpenAI, OpenRouter, a local
+       server, …) to use it instead of OpenAI directly.
+
+Example ``~/.maigret/settings.json`` snippet using a non-OpenAI
+endpoint:
+
+.. code-block:: json
+
+   {
+       "openai_api_key": "sk-...",
+       "openai_model": "gpt-4o-mini",
+       "openai_api_base_url": "https://openrouter.ai/api/v1"
+   }
+
+The key resolution order is ``settings.openai_api_key`` → ``OPENAI_API_KEY``
+environment variable; the first non-empty value wins.
+
+.. note::
+
+   ``--ai`` sends the full internal Markdown report (which contains the
+   gathered profile data) to the configured endpoint. Only use providers
+   and accounts you trust with that data.

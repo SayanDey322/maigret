@@ -3,11 +3,17 @@
 import copy
 import json
 import os
+import subprocess
+import sys
+import textwrap
+import zipfile
 import pytest
 from io import StringIO
+from xml.etree import ElementTree
 
 import xmind  # type: ignore[import-untyped]
 from jinja2 import Template
+from markupsafe import escape
 
 from maigret.report import (
     filter_supposed_data,
@@ -26,10 +32,16 @@ from maigret.report import (
     generate_report_context,
     generate_json_report,
     get_plaintext_report,
+    _build_maigret_graph,
+    _graph_to_cypher,
+    _is_safe_report_image_url,
+    _pdf_report_link_callback,
+    _BLANK_IMAGE_PATH,
+    _normalize_xmind_archive,
 )
+from maigret.errors import CheckError
 from maigret.result import MaigretCheckResult, MaigretCheckStatus
-from maigret.sites import MaigretSite
-
+from maigret.sites import MaigretDatabase, MaigretSite
 
 GOOD_RESULT = MaigretCheckResult('', '', '', MaigretCheckStatus.CLAIMED)
 BAD_RESULT = MaigretCheckResult('', '', '', MaigretCheckStatus.AVAILABLE)
@@ -61,6 +73,26 @@ BROKEN_RESULTS = {
         'url_main': 'https://www.github.com/',
         'url_user': 'https://www.github.com/test',
         'http_status': 200,
+        'is_similar': False,
+        'rank': 78,
+        'site': MaigretSite('test', {}),
+    }
+}
+
+ERROR_RESULTS = {
+    'GitHub': {
+        'username': 'test',
+        'parsing_enabled': True,
+        'url_main': 'https://www.github.com/',
+        'url_user': 'https://www.github.com/test',
+        'status': MaigretCheckResult(
+            'test',
+            'GitHub',
+            'https://www.github.com/test',
+            MaigretCheckStatus.UNKNOWN,
+            error=CheckError('Request timeout', 'slow server'),
+        ),
+        'http_status': 0,
         'is_similar': False,
         'rank': 78,
         'site': MaigretSite('test', {}),
@@ -290,8 +322,8 @@ def test_generate_csv_report():
     data = csvfile.readlines()
 
     assert data == [
-        'username,name,url_main,url_user,exists,http_status\r\n',
-        'test,GitHub,https://www.github.com/,https://www.github.com/test,Claimed,200\r\n',
+        'username,name,url_main,url_user,exists,http_status,error_reason\r\n',
+        'test,GitHub,https://www.github.com/,https://www.github.com/test,Claimed,200,\r\n',
     ]
 
 
@@ -303,9 +335,88 @@ def test_generate_csv_report_broken():
     data = csvfile.readlines()
 
     assert data == [
-        'username,name,url_main,url_user,exists,http_status\r\n',
-        'test,GitHub,https://www.github.com/,https://www.github.com/test,Unknown,200\r\n',
+        'username,name,url_main,url_user,exists,http_status,error_reason\r\n',
+        'test,GitHub,https://www.github.com/,https://www.github.com/test,Unknown,200,Unknown\r\n',
     ]
+
+
+def test_generate_csv_report_error_reason():
+    csvfile = StringIO()
+    generate_csv_report('test', ERROR_RESULTS, csvfile)
+
+    csvfile.seek(0)
+    data = csvfile.readlines()
+
+    assert data == [
+        'username,name,url_main,url_user,exists,http_status,error_reason\r\n',
+        'test,GitHub,https://www.github.com/,https://www.github.com/test,Unknown,0,Request timeout error: slow server\r\n',
+    ]
+
+
+def test_generate_neo4j_report():
+    import networkx as nx
+
+    G = nx.Graph()
+    G.add_node("username: alice")
+    G.add_node("account: https://github.com/alice")
+    G.add_node("bio: o'brien\nbreak")  # tricky value: single quote + newline
+    G.add_edge("username: alice", "account: https://github.com/alice")
+
+    cypher = _graph_to_cypher(G)
+
+    assert "CREATE CONSTRAINT maigret_node_name IF NOT EXISTS" in cypher
+    assert cypher.count("MERGE (n:MaigretNode {name: ") == 3
+    assert cypher.count("-[:LINKED_TO]->") == 1
+    assert "SET n.type = 'username', n.label = 'alice'" in cypher
+
+    # the value with a quote and a newline stays on one terminated line, escaped
+    bio_lines = [ln for ln in cypher.splitlines() if "bio:" in ln]
+    assert len(bio_lines) == 1
+    assert bio_lines[0].endswith(";")
+    assert "o\\'brien\\nbreak" in bio_lines[0]
+
+
+def test_build_graph_accepts_non_string_identity_values():
+    status = MaigretCheckResult(
+        'user',
+        'ExampleSite',
+        'https://example.com/user',
+        MaigretCheckStatus.CLAIMED,
+        ids_data={
+            'uid': 4242,
+            'age': 30,
+            'verified': True,
+            'aliases': [1234, 'https://example.com/alias'],
+            'metadata': {'source': 'api'},
+            'image': 'https://example.com/avatar.png',
+        },
+    )
+    results = [
+        (
+            'user',
+            'username',
+            {
+                'ExampleSite': {
+                    'status': status,
+                    'url_user': 'https://example.com/user',
+                }
+            },
+        )
+    ]
+    db = MaigretDatabase().update_site(
+        MaigretSite('ExampleSite', {'url': 'https://example.com/{username}'})
+    )
+
+    graph = _build_maigret_graph(results, db)
+
+    assert 'uid: 4242' in graph
+    assert 'age: 30' in graph
+    assert 'verified: True' in graph
+    assert "metadata: {'source': 'api'}" in graph
+    assert '1234: ExampleSite' in graph
+    assert 'username: alias' in graph
+    assert graph.has_edge('account: https://example.com/user', 'age: 30')
+    assert not any(str(node).startswith('image:') for node in graph)
 
 
 def test_generate_txt_report():
@@ -392,6 +503,125 @@ def test_save_xmind_report():
     )
 
 
+def test_xmind_report_has_complete_manifest_and_valid_zip(tmp_path):
+    filename = tmp_path / 'unicode-report.xmind'
+
+    save_xmind_report(filename, '测试-Élodie', EXAMPLE_RESULTS)
+
+    with zipfile.ZipFile(filename) as archive:
+        assert archive.testzip() is None
+        names = archive.namelist()
+        assert names.count('META-INF/manifest.xml') == 1
+        manifest = ElementTree.fromstring(archive.read('META-INF/manifest.xml'))
+
+    manifest_namespace = 'urn:xmind:xmap:xmlns:manifest:1.0'
+    assert manifest.tag == f'{{{manifest_namespace}}}manifest'
+    assert manifest.attrib == {'password-hint': ''}
+    namespace = {'manifest': manifest_namespace}
+    entries = manifest.findall('manifest:file-entry', namespace)
+    assert [entry.attrib['full-path'] for entry in entries] == names
+    assert all('media-type' in entry.attrib for entry in entries)
+    assert all(
+        entry.attrib['media-type'] == 'text/xml'
+        for entry in entries
+        if entry.attrib['full-path'].endswith('.xml')
+    )
+
+    workbook = xmind.load(str(filename))
+    data = workbook.getPrimarySheet().getData()
+    assert data['title'] == '测试-Élodie Analysis'
+    assert data['topic']['title'] == '测试-Élodie'
+    assert data['topic']['topics'][1]['title'] == 'test_tag'
+
+
+def test_xmind_normalization_is_idempotent_and_preserves_members(tmp_path):
+    filename = tmp_path / 'report.xmind'
+    save_xmind_report(filename, 'test', EXAMPLE_RESULTS)
+    with zipfile.ZipFile(filename, mode='a') as archive:
+        archive.comment = b'Maigret XMind archive'
+
+    with zipfile.ZipFile(filename) as archive:
+        original_comment = archive.comment
+        original_members = [
+            (
+                archive.read(info),
+                info.filename,
+                info.compress_type,
+                info.date_time,
+                info.comment,
+                info.extra,
+                info.create_system,
+                info.create_version,
+                info.extract_version,
+                info.internal_attr,
+                info.external_attr,
+                info.flag_bits,
+            )
+            for info in archive.infolist()
+            if info.filename != 'META-INF/manifest.xml'
+        ]
+
+    _normalize_xmind_archive(filename)
+    normalized_once = filename.read_bytes()
+    _normalize_xmind_archive(filename)
+
+    with zipfile.ZipFile(filename) as archive:
+        assert archive.testzip() is None
+        assert archive.namelist().count('META-INF/manifest.xml') == 1
+        normalized_comment = archive.comment
+        normalized_members = [
+            (
+                archive.read(info),
+                info.filename,
+                info.compress_type,
+                info.date_time,
+                info.comment,
+                info.extra,
+                info.create_system,
+                info.create_version,
+                info.extract_version,
+                info.internal_attr,
+                info.external_attr,
+                info.flag_bits,
+            )
+            for info in archive.infolist()
+            if info.filename != 'META-INF/manifest.xml'
+        ]
+
+    assert normalized_comment == original_comment
+    assert normalized_members == original_members
+    assert filename.read_bytes() == normalized_once
+
+
+def test_xmind_report_regeneration_drops_obsolete_archive_members(tmp_path):
+    filename = tmp_path / 'report.xmind'
+    save_xmind_report(filename, 'first', EXAMPLE_RESULTS)
+    with zipfile.ZipFile(filename, mode='a') as archive:
+        archive.writestr('obsolete.txt', b'stale report data')
+
+    save_xmind_report(filename, 'second', EXAMPLE_RESULTS)
+
+    with zipfile.ZipFile(filename) as archive:
+        assert 'obsolete.txt' not in archive.namelist()
+        assert archive.testzip() is None
+    workbook = xmind.load(str(filename))
+    assert workbook.getPrimarySheet().getData()['topic']['title'] == 'second'
+
+
+def test_xmind_normalization_failure_is_atomic(tmp_path, monkeypatch):
+    filename = tmp_path / 'report.xmind'
+    save_xmind_report(filename, 'test', EXAMPLE_RESULTS)
+    original = filename.read_bytes()
+
+    monkeypatch.setattr(zipfile.ZipFile, 'testzip', lambda self: 'content.xml')
+
+    with pytest.raises(ValueError, match='content.xml'):
+        _normalize_xmind_archive(filename)
+
+    assert filename.read_bytes() == original
+    assert list(tmp_path.iterdir()) == [filename]
+
+
 def test_save_xmind_report_broken():
     filename = 'report_test.xmind'
     save_xmind_report(filename, 'test', BROKEN_RESULTS)
@@ -402,8 +632,33 @@ def test_save_xmind_report_broken():
 
     assert data['title'] == 'test Analysis'
     assert data['topic']['title'] == 'test'
-    assert len(data['topic']['topics']) == 1
+    assert len(data['topic']['topics']) == 2
     assert data['topic']['topics'][0]['title'] == 'Undefined'
+    assert data['topic']['topics'][1]['title'] == 'Errors'
+    assert data['topic']['topics'][1]['topics'][0]['title'] == 'GitHub: Unknown'
+
+
+def test_save_xmind_report_error_reason():
+    filename = 'report_test.xmind'
+    save_xmind_report(filename, 'test', ERROR_RESULTS)
+
+    workbook = xmind.load(filename)
+    sheet = workbook.getPrimarySheet()
+    data = sheet.getData()
+
+    assert data['title'] == 'test Analysis'
+    assert data['topic']['title'] == 'test'
+    assert len(data['topic']['topics']) == 2
+    assert data['topic']['topics'][0]['title'] == 'Undefined'
+    assert data['topic']['topics'][1]['title'] == 'Errors'
+    assert (
+        data['topic']['topics'][1]['topics'][0]['title']
+        == 'GitHub: Request timeout error: slow server'
+    )
+    assert (
+        data['topic']['topics'][1]['topics'][0]['label']
+        == 'https://www.github.com/test'
+    )
 
 
 def test_html_report():
@@ -413,9 +668,99 @@ def test_html_report():
 
     report_text = open(report_name).read()
 
-    assert SUPPOSED_BRIEF in report_text
+    # the HTML report escapes its context, so the brief is rendered with
+    # HTML entities (e.g. the apostrophe in "target's")
+    assert str(escape(SUPPOSED_BRIEF)) in report_text
     assert SUPPOSED_GEO in report_text
     assert SUPPOSED_INTERESTS in report_text
+
+
+# profile data from scanned sites must be escaped so a planted payload cannot
+# execute in the report
+XSS_NAME_PAYLOAD = '<img src=x onerror=alert(document.domain)>'
+XSS_IMAGE_PAYLOAD = 'x" onerror="alert(1)'
+XSS_LINK_PAYLOAD = 'http://evil.example/"><script>alert(1)</script>'
+
+
+def _xss_username_results():
+    result = copy.deepcopy(GOOD_RESULT)
+    result.tags = ['photo', 'us']
+    result.ids_data = {
+        "name": XSS_NAME_PAYLOAD,
+        "bio": XSS_NAME_PAYLOAD,
+        "image": XSS_IMAGE_PAYLOAD,
+        "external_url": XSS_LINK_PAYLOAD,
+    }
+    data = {
+        'EvilSite': {
+            'username': 'victimtarget',
+            'parsing_enabled': True,
+            'url_main': 'https://evil.example/',
+            'url_user': 'https://evil.example/victimtarget',
+            'status': result,
+            'http_status': 200,
+            'is_similar': False,
+            'rank': 1,
+            'site': MaigretSite('EvilSite', {}),
+            'found': True,
+            'ids_data': result.ids_data,
+        },
+    }
+    return [('victimtarget', 'username', data)]
+
+
+def _assert_no_xss(rendered: str):
+    # no executable payload markup survives, only escaped (harmless) text
+    assert XSS_NAME_PAYLOAD not in rendered
+    assert '<img src=x onerror' not in rendered
+    assert '<script>alert(1)</script>' not in rendered
+    assert 'onerror="alert(1)"' not in rendered  # image attribute breakout
+    assert '&lt;img src=x onerror=alert(document.domain)&gt;' in rendered
+
+
+def test_html_report_escapes_extracted_profile_data():
+    context = generate_report_context(_xss_username_results())
+    template, _ = generate_report_template(is_pdf=False)
+    rendered = template.render(**context)
+
+    _assert_no_xss(rendered)
+
+
+def test_pdf_report_escapes_extracted_profile_data():
+    context = generate_report_context(_xss_username_results())
+    template, _ = generate_report_template(is_pdf=True)
+    rendered = template.render(**context)
+
+    _assert_no_xss(rendered)
+
+
+def test_report_preserves_legit_auto_link():
+    # A benign extracted link must still render as a real, clickable anchor.
+    result = copy.deepcopy(GOOD_RESULT)
+    result.ids_data = {"external_url": "https://example.com/profile"}
+    data = {
+        'Site': {
+            'username': 'u',
+            'parsing_enabled': True,
+            'url_main': 'https://example.com/',
+            'url_user': 'https://example.com/u',
+            'status': result,
+            'http_status': 200,
+            'is_similar': False,
+            'rank': 1,
+            'site': MaigretSite('Site', {}),
+            'found': True,
+            'ids_data': result.ids_data,
+        },
+    }
+    context = generate_report_context([('u', 'username', data)])
+    template, _ = generate_report_template(is_pdf=False)
+    rendered = template.render(**context)
+
+    assert (
+        '<a class="auto-link" href="https://example.com/profile">'
+        'https://example.com/profile</a>'
+    ) in rendered
 
 
 def test_html_report_broken():
@@ -440,6 +785,261 @@ def test_pdf_report():
     save_pdf_report(report_name, context)
 
     assert os.path.exists(report_name)
+
+
+def test_save_pdf_report_raises_helpful_error_without_xhtml2pdf(
+    monkeypatch, tmp_path
+):
+    # Setting an entry to None makes a subsequent `import` raise ImportError —
+    # this simulates the optional 'pdf' extra not being installed without
+    # actually uninstalling xhtml2pdf from the test environment.
+    monkeypatch.setitem(sys.modules, 'xhtml2pdf', None)
+    monkeypatch.setitem(sys.modules, 'xhtml2pdf.pisa', None)
+
+    context = generate_report_context(TEST)
+    target = tmp_path / "report.pdf"
+
+    with pytest.raises(RuntimeError) as excinfo:
+        save_pdf_report(str(target), context)
+
+    msg = str(excinfo.value)
+    assert "maigret[pdf]" in msg
+    assert "pip install" in msg
+    assert not target.exists()
+
+
+def test_xhtml2pdf_is_not_module_level_dependency():
+    # Guard against a regression where someone hoists `import xhtml2pdf` /
+    # `from xhtml2pdf import pisa` to the top of maigret/report.py — that
+    # would force every Maigret user to install the optional extra.
+    import maigret.report as report_module
+
+    module_globals = vars(report_module)
+    assert 'xhtml2pdf' not in module_globals
+    assert 'pisa' not in module_globals
+
+
+# Report images come from scraped profile data and are attacker-influenced;
+# xhtml2pdf resolves <img src> while rendering the PDF, so an intranet URL is a
+# request from the host, and a src with no scheme is opened as a local file.
+def test_is_safe_report_image_url_rejects_dangerous():
+    bad = [
+        "file:///etc/passwd",
+        "file://C:/Windows/win.ini",
+        "data:text/html,<script>",
+        "ftp://example.com/x.png",
+        "http://127.0.0.1/a.png",
+        "http://localhost/a.png",
+        "http://169.254.169.254/latest/meta-data/",
+        "http://10.0.0.5/a.png",
+        "http://192.168.1.1/a.png",
+        "http://172.16.0.1/a.png",
+        "http://[::1]/a.png",
+        "http://0.0.0.0/a.png",
+        "//example.com/a.png",  # scheme-relative, no scheme
+        # No scheme at all: xhtml2pdf treats these as local paths and opens them.
+        "/etc/passwd",
+        "C:/Windows/win.ini",
+        "../../../../etc/shadow",
+        "",
+        None,
+        42,
+    ]
+    for value in bad:
+        assert _is_safe_report_image_url(value) is False, value
+
+
+def test_is_safe_report_image_url_rejects_non_global_ranges():
+    # Ranges that the private/loopback/link-local flags alone do not catch.
+    bad = [
+        # CGNAT / shared address space, common inside cloud and k8s networks.
+        "http://100.64.0.1/a.png",
+        "http://100.127.255.254/a.png",
+        # Multicast and reserved are still is_global on CPython, so a bare
+        # `return ip.is_global` would let these through.
+        "http://224.0.0.1/a.png",
+        "http://239.255.255.250/a.png",
+        "http://[ff02::1]/a.png",
+        # NAT64 well-known prefix: reaches 10.0.0.1 through a NAT64 gateway.
+        "http://[64:ff9b::a00:1]/a.png",
+        # IPv4-mapped IPv6 forms of blocked v4 addresses.
+        "http://[::ffff:127.0.0.1]/a.png",
+        "http://[::ffff:169.254.169.254]/a.png",
+    ]
+    for value in bad:
+        assert _is_safe_report_image_url(value) is False, value
+
+
+def test_is_safe_report_image_url_allows_public_hosts():
+    # IP literals resolve without DNS, so this stays offline and deterministic.
+    assert _is_safe_report_image_url("https://1.1.1.1/avatar.png") is True
+    assert _is_safe_report_image_url("http://8.8.8.8/avatar.png") is True
+
+
+def test_pdf_link_callback_diverts_unsafe_to_local_blank():
+    assert os.path.exists(_BLANK_IMAGE_PATH)
+    # Unsafe URLs resolve to a local placeholder path, so xhtml2pdf never
+    # fetches or reads them.
+    assert _pdf_report_link_callback("file:///etc/passwd", "") == _BLANK_IMAGE_PATH
+    assert (
+        _pdf_report_link_callback("http://169.254.169.254/x", "") == _BLANK_IMAGE_PATH
+    )
+    # Safe public URLs pass through unchanged.
+    url = "https://1.1.1.1/a.png"
+    assert _pdf_report_link_callback(url, "") == url
+
+
+def test_pdf_report_does_not_fetch_unsafe_image(tmp_path):
+    pytest.importorskip("xhtml2pdf")
+    import http.server
+    import socketserver
+    import threading
+
+    hits = []
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            hits.append(self.path)
+            self.send_response(404)
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    srv = socketserver.TCPServer(("127.0.0.1", 0), _Handler)
+    port = srv.server_address[1]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        internal = f"http://127.0.0.1:{port}/SSRF-should-not-happen"
+        res = MaigretCheckResult(
+            "alice",
+            "TestSite",
+            "http://testsite/alice",
+            MaigretCheckStatus.CLAIMED,
+            ids_data={"image": internal},
+        )
+        username_results = [
+            (
+                "alice",
+                "username",
+                {"TestSite": {"status": res, "url_user": "http://testsite/alice"}},
+            )
+        ]
+        context = generate_report_context(username_results)
+        target = tmp_path / "report.pdf"
+        save_pdf_report(str(target), context)
+        assert target.exists()
+    finally:
+        srv.shutdown()
+
+    assert hits == [], f"PDF generation fetched a blocked URL: {hits}"
+
+
+def test_import_maigret_without_pdf_extras():
+    # End-to-end check: spawn a fresh interpreter with every package in the
+    # [pdf] extra blocked before any maigret module is loaded, and confirm
+    # the package, the report module, and save_pdf_report itself all import
+    # cleanly. Mirrors what a user who ran `pip install maigret` (without
+    # [pdf]) would experience.
+    code = textwrap.dedent(
+        """
+        import sys
+        for name in (
+            'xhtml2pdf', 'xhtml2pdf.pisa',
+            'arabic_reshaper',
+            'bidi', 'bidi.algorithm',
+        ):
+            sys.modules[name] = None
+
+        import maigret
+        import maigret.report
+        from maigret.report import save_pdf_report
+
+        assert callable(save_pdf_report)
+        print("OK")
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert "OK" in result.stdout
+
+
+def test_save_graph_report_writes_utf8(tmp_path):
+    """The graph HTML must be written with an explicit encoding.
+
+    pyvis inlines the whole vis-network bundle, which carries several hundred
+    non-ASCII characters of its own, and its show() opens the target file
+    without an encoding argument. That means the locale codepage, so on a
+    default Windows install (cp1252) every graph report died with
+    UnicodeEncodeError no matter what was scanned. The check runs in a fresh
+    interpreter under -X warn_default_encoding so a return to the implicit
+    locale encoding fails here too, not only on a non-utf-8 machine.
+    """
+    target = tmp_path / "report_graph.html"
+    probe = tmp_path / "graph_probe.py"
+    code = textwrap.dedent(
+        f"""
+        from maigret.report import save_graph_report
+        from maigret.result import MaigretCheckResult, MaigretCheckStatus
+        from maigret.sites import MaigretDatabase
+
+        status = MaigretCheckResult(
+            'алекс',
+            'GitHub',
+            'https://github.com/алекс',
+            MaigretCheckStatus.CLAIMED,
+        )
+        results = [
+            (
+                'алекс',
+                'username',
+                {{
+                    'GitHub': {{
+                        'status': status,
+                        'url_user': 'https://github.com/алекс',
+                    }}
+                }},
+            )
+        ]
+
+        save_graph_report({str(target)!r}, results, MaigretDatabase())
+        print("OK")
+        """
+    )
+    probe.write_text(code, encoding="utf-8")
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-X",
+            "warn_default_encoding",
+            "-W",
+            "error::EncodingWarning",
+            str(probe),
+        ],
+        capture_output=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    assert result.returncode == 0, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert "OK" in result.stdout
+
+    html = target.read_bytes().decode("utf-8")
+    assert '<meta charset="utf-8">' in html
+    # the inlined bundle is what used to blow up: it carries non-ASCII of its
+    # own, and it has to survive the round trip
+    assert "\u00a9" in html
+    # the scanned username reaches the graph too (pyvis escapes it into the
+    # embedded JSON, hence the \uXXXX form)
+    assert r"username: \u0430\u043b\u0435\u043a\u0441" in html
 
 
 def test_text_report():

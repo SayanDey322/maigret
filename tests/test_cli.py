@@ -11,13 +11,17 @@ DEFAULT_ARGS: Dict[str, Any] = {
     'csv': False,
     'db_file': 'resources/data.json',
     'debug': False,
+    'dns_resolver': 'async',
     'diagnose': False,
     'disable_extracting': False,
     'disable_recursive_search': False,
+    'enrich': False,
     'folderoutput': 'reports',
     'html': False,
     'graph': False,
+    'neo4j': False,
     'id_type': 'username',
+    'input_file': None,
     'ignore_ids_list': [],
     'info': False,
     'json': '',
@@ -50,9 +54,12 @@ DEFAULT_ARGS: Dict[str, Any] = {
     'xmind': False,
     'md': False,
     'ai': False,
-    'ai_model': 'gpt-4o',
+    'ai_model': 'gpt-5.4',
     'no_autoupdate': False,
     'force_update': False,
+    'cloudflare_bypass': False,
+    'keywords': [],
+    'dns_resolver': 'async',
 }
 
 
@@ -75,6 +82,19 @@ def test_args_search_mode_several_usernames(argparser):
 
     want_args = dict(DEFAULT_ARGS)
     want_args.update({'username': ['username1', 'username2']})
+
+    for arg in vars(args):
+        assert getattr(args, arg) == want_args[arg]
+
+
+def test_args_input_file(argparser):
+    args = argparser.parse_args('--input-file ids.txt'.split())
+
+    assert args.username == []
+    assert args.input_file == 'ids.txt'
+
+    want_args = dict(DEFAULT_ARGS)
+    want_args.update({'input_file': 'ids.txt'})
 
     for arg in vars(args):
         assert getattr(args, arg) == want_args[arg]

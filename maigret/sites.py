@@ -1,11 +1,15 @@
 # ****************************** -*-
 """Maigret Sites Information"""
+
 import copy
 import json
+import logging
 import sys
 from typing import Optional, List, Dict, Any, Tuple
 
 from .utils import CaseConverter, URLMatcher, is_country_tag
+
+logger = logging.getLogger(__name__)
 
 
 class MaigretEngine:
@@ -53,6 +57,8 @@ class MaigretSite:
 
     # Type of identifier (username, gaia_id etc); see SUPPORTED_IDS in checking.py
     type = "username"
+    # Forced response encoding, overriding a wrong/lying Content-Type charset
+    encoding = None
     # Custom HTTP headers
     headers: Dict[str, str] = {}
     # Error message substrings
@@ -175,7 +181,9 @@ class MaigretSite:
                         self.__dict__[CaseConverter.camel_to_snake(group)],
                     )
 
-            self.url_regexp = URLMatcher.make_profile_url_regexp(url, self.regex_check or "")
+            self.url_regexp = URLMatcher.make_profile_url_regexp(
+                url, self.regex_check or ""
+            )
 
     def detect_username(self, url: str) -> Optional[str]:
         if self.url_regexp:
@@ -269,9 +277,18 @@ class MaigretSite:
         for k, v in engine_data.items():
             field = CaseConverter.camel_to_snake(k)
             if isinstance(v, dict):
-                # TODO: assertion of intersecting keys
                 # update dicts like errors
-                self.__dict__.get(field, {}).update(v)
+                target = self.__dict__.get(field, {})
+                for item_key, item_value in v.items():
+                    if item_key in target and target[item_key] != item_value:
+                        logger.warning(
+                            "Engine %s overrides %s.%s for site %s",
+                            engine.name,
+                            field,
+                            item_key,
+                            self.name,
+                        )
+                target.update(v)
             elif isinstance(v, list):
                 self.__dict__[field] = self.__dict__.get(field, []) + v
             else:
@@ -380,19 +397,20 @@ class MaigretDatabase:
         is_engine_ok = (
             lambda x: isinstance(x.engine, str) and x.engine.lower() in normalized_tags
         )
-        is_tags_ok = lambda x: set(x.tags).intersection(set(normalized_tags))
+        is_tags_ok = lambda x: set(map(str.lower, x.tags)).intersection(
+            set(normalized_tags)
+        )
         is_protocol_in_tags = lambda x: x.protocol and x.protocol in normalized_tags
         is_disabled_needed = lambda x: not x.disabled or (
             "disabled" in tags or disabled
         )
         is_id_type_ok = lambda x: x.type == id_type
 
-        is_excluded_by_tag = lambda x: set(
-            map(str.lower, x.tags)
-        ).intersection(set(normalized_excluded_tags))
+        is_excluded_by_tag = lambda x: set(map(str.lower, x.tags)).intersection(
+            set(normalized_excluded_tags)
+        )
         is_excluded_by_engine = lambda x: (
-            isinstance(x.engine, str)
-            and x.engine.lower() in normalized_excluded_tags
+            isinstance(x.engine, str) and x.engine.lower() in normalized_excluded_tags
         )
         is_excluded_by_protocol = lambda x: (
             x.protocol and x.protocol in normalized_excluded_tags
@@ -462,9 +480,9 @@ class MaigretDatabase:
         return {engine.name: engine for engine in self._engines}
 
     def update_site(self, site: MaigretSite) -> "MaigretDatabase":
-        for s in self._sites:
+        for i, s in enumerate(self._sites):
             if s.name == site.name:
-                s = site
+                self._sites[i] = site
                 return self
 
         self._sites.append(site)
@@ -633,9 +651,7 @@ class MaigretDatabase:
             if site.engine:
                 engine_total[site.engine] = engine_total.get(site.engine, 0) + 1
                 if not site.disabled:
-                    engine_enabled[site.engine] = (
-                        engine_enabled.get(site.engine, 0) + 1
-                    )
+                    engine_enabled[site.engine] = engine_enabled.get(site.engine, 0) + 1
 
             # Count tags
             if not site.tags:

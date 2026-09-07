@@ -1,13 +1,25 @@
 # Configuration file for the Sphinx documentation builder.
 
+import os
+
 # -- Project information
 
 project = 'Maigret'
 copyright = '2025, soxoj'
 author = 'soxoj'
 
-release = '0.5.0'
-version = '0.5'
+release = '0.6.5'
+version = '0.6'
+
+# -- Internationalization
+#
+# Default to English. Translation projects on Read the Docs set the
+# ``READTHEDOCS_LANGUAGE`` env var (e.g. ``zh_CN``); locally the language
+# can be overridden via ``sphinx-build -D language=zh_CN``.
+language = os.environ.get('READTHEDOCS_LANGUAGE', 'en')
+locale_dirs = ['locale/']
+gettext_compact = False
+gettext_uuid = True
 
 # -- General configuration
 
@@ -31,6 +43,8 @@ templates_path = ['_templates']
 # -- Options for HTML output
 
 html_theme = 'sphinx_rtd_theme'
+html_static_path = ['_static']
+html_js_files = ['maigret_search_help.js']
 
 # -- Options for EPUB output
 epub_show_urls = 'footnote'

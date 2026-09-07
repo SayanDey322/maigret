@@ -7,110 +7,11 @@ import sys
 
 from colorama import Fore, Style, init
 
-from .result import MaigretCheckStatus
+from .result import MaigretCheckStatus, KeywordMatchStatus
 from .utils import get_dict_ascii_tree
 
 
-class QueryNotify:
-    """Query Notify Object.
-
-    Base class that describes methods available to notify the results of
-    a query.
-    It is intended that other classes inherit from this base class and
-    override the methods to implement specific functionality.
-    """
-
-    def __init__(self, result=None):
-        """Create Query Notify Object.
-
-        Contains information about a specific method of notifying the results
-        of a query.
-
-        Keyword Arguments:
-        self                   -- This object.
-        result                 -- Object of type QueryResult() containing
-                                  results for this query.
-
-        Return Value:
-        Nothing.
-        """
-
-        self.result = result
-
-        return
-
-    def start(self, message=None, id_type="username"):
-        """Notify Start.
-
-        Notify method for start of query.  This method will be called before
-        any queries are performed.  This method will typically be
-        overridden by higher level classes that will inherit from it.
-
-        Keyword Arguments:
-        self                   -- This object.
-        message                -- Object that is used to give context to start
-                                  of query.
-                                  Default is None.
-
-        Return Value:
-        Nothing.
-        """
-
-        return
-
-    def update(self, result):
-        """Notify Update.
-
-        Notify method for query result.  This method will typically be
-        overridden by higher level classes that will inherit from it.
-
-        Keyword Arguments:
-        self                   -- This object.
-        result                 -- Object of type QueryResult() containing
-                                  results for this query.
-
-        Return Value:
-        Nothing.
-        """
-
-        self.result = result
-
-        return
-
-    def finish(self, message=None):
-        """Notify Finish.
-
-        Notify method for finish of query.  This method will be called after
-        all queries have been performed.  This method will typically be
-        overridden by higher level classes that will inherit from it.
-
-        Keyword Arguments:
-        self                   -- This object.
-        message                -- Object that is used to give context to start
-                                  of query.
-                                  Default is None.
-
-        Return Value:
-        Nothing.
-        """
-
-        return
-
-    def __str__(self):
-        """Convert Object To String.
-
-        Keyword Arguments:
-        self                   -- This object.
-
-        Return Value:
-        Nicely formatted string to get information about this object.
-        """
-        result = str(self.result)
-
-        return result
-
-
-class QueryNotifyPrint(QueryNotify):
+class QueryNotifyPrint:
     """Query Notify Print Object.
 
     Query notify class that prints results.
@@ -145,7 +46,7 @@ class QueryNotifyPrint(QueryNotify):
         # Colorama module's initialization.
         init(autoreset=True)
 
-        super().__init__(result)
+        self.result = result
         self.verbose = verbose
         self.print_found_only = print_found_only
         self.skip_check_errors = skip_check_errors
@@ -194,7 +95,7 @@ class QueryNotifyPrint(QueryNotify):
 
         title = f"Checking {id_type}"
         if self.color:
-            print(
+            _print_encodable(
                 Style.BRIGHT
                 + Fore.GREEN
                 + "["
@@ -208,25 +109,55 @@ class QueryNotifyPrint(QueryNotify):
                 + " on:"
             )
         else:
-            print(f"[*] {title} {message} on:")
+            _print_encodable(f"[*] {title} {message} on:")
+
+    def finish(self, message=None):
+        # Hook called at the end of a run. Currently a no-op; kept on the
+        # surface because the search loop calls it (checking.py:finish()).
+        return
 
     def _colored_print(self, fore_color, msg):
         if self.color:
-            print(Style.BRIGHT + fore_color + msg)
+            _print_encodable(Style.BRIGHT + fore_color + msg)
         else:
-            print(msg)
+            _print_encodable(msg)
 
     def success(self, message, symbol="+"):
         msg = f"[{symbol}] {message}"
         self._colored_print(Fore.GREEN, msg)
 
-    def warning(self, message, symbol="-"):
+    def warning(self, message, symbol="-", advice=None):
+        """Print a warning. When ``advice`` is supplied it is appended after
+        the headline in *normal* weight (same colour), so the actionable
+        text reads as guidance rather than as part of the alarm itself."""
         msg = f"[{symbol}] {message}"
-        self._colored_print(Fore.YELLOW, msg)
+        if advice and self.color:
+            # Bold + yellow for the count line; turn off bold for the advice
+            # but keep the yellow until the line is reset at the end.
+            _print_encodable(
+                Style.BRIGHT + Fore.YELLOW + msg
+                + Style.NORMAL + ". " + advice
+                + Style.RESET_ALL
+            )
+        elif advice:
+            # No-colour mode: dot separator is enough to distinguish the
+            # parts, no ANSI codes leak into the output.
+            _print_encodable(f"{msg}. {advice}")
+        else:
+            self._colored_print(Fore.YELLOW, msg)
 
     def info(self, message, symbol="*"):
         msg = f"[{symbol}] {message}"
         self._colored_print(Fore.BLUE, msg)
+
+    def enrich(self, message, symbol="*", verbose_only=False):
+        """Magenta line for --enrich events. verbose_only=True hides the line
+        unless the notifier was constructed with verbose=True."""
+        if verbose_only and not self.verbose:
+            return
+        sys.stdout.write("\x1b[1K\r")
+        msg = f"[{symbol}] {message}"
+        self._colored_print(Fore.MAGENTA, msg)
 
     def update(self, result, is_similar=False):
         """Notify Update.
@@ -249,19 +180,38 @@ class QueryNotifyPrint(QueryNotify):
 
         ids_data_text = ""
         if self.result.ids_data:
-            ids_data_text = get_dict_ascii_tree(self.result.ids_data.items(), " ")
+            items = self.result.ids_data.items()
+            if not self.verbose:
+                # _extractor is metadata from socid_extractor 0.1+; hide in default view
+                items = [(k, v) for k, v in items if k != "_extractor"]
+            ids_data_text = get_dict_ascii_tree(items, " ")
 
         # Output to the terminal is desired.
         if result.status == MaigretCheckStatus.CLAIMED:
-            color = Fore.BLUE if is_similar else Fore.GREEN
-            status = "?" if is_similar else "+"
-            notify = self.make_terminal_notify(
-                status,
-                result.site_name,
-                color,
-                color,
-                result.site_url_user + ids_data_text,
-            )
+            # Check if this is a keyword match
+            if (result.keyword_match_status == KeywordMatchStatus.KEYWORD_FOUND and 
+                result.keywords):
+                # Keyword-context match: site contains username + at least one keyword
+                color = Fore.LIGHTGREEN_EX
+                status = "++"
+                notify = self.make_terminal_notify(
+                    status,
+                    result.site_name,
+                    color,
+                    color,
+                    result.site_url_user + ids_data_text,
+                )
+            else:
+                # Normal claimed site
+                color = Fore.BLUE if is_similar else Fore.GREEN
+                status = "?" if is_similar else "+"
+                notify = self.make_terminal_notify(
+                    status,
+                    result.site_name,
+                    color,
+                    color,
+                    result.site_url_user + ids_data_text,
+                )
         elif result.status == MaigretCheckStatus.AVAILABLE:
             if not self.print_found_only:
                 notify = self.make_terminal_notify(
@@ -299,7 +249,7 @@ class QueryNotifyPrint(QueryNotify):
 
         if notify:
             sys.stdout.write("\x1b[1K\r")
-            print(notify)
+            _print_encodable(notify)
 
         return notify
 
@@ -315,3 +265,70 @@ class QueryNotifyPrint(QueryNotify):
         result = str(self.result)
 
         return result
+
+
+PATREON_URL = "https://www.patreon.com/soxoj"
+INTRO_TEXT = "MAIGRET - collect a dossier by username from 3000+ sites"
+
+
+def _print_encodable(text: str) -> None:
+    """Print text the active stdout encoding may not be able to represent.
+
+    On Windows, Python takes stdout's encoding from the process ANSI
+    codepage, which is cp1252 on a default install and has no U+2665. The
+    banners below carry one, so printing them raised UnicodeEncodeError
+    before a single site was checked, and --no-color did not help because
+    the character sits in that branch too. PYTHONIOENCODING cannot rescue
+    the PyInstaller build, which ignores PYTHON* environment variables.
+
+    Every line this module writes goes through here for the same reason.
+    A run reaches text the codepage cannot hold in two ordinary ways: the
+    --enrich notifications built in checking.py carry U+2192, and extracted
+    profile fields carry whatever script the page was written in. Both
+    arrive mid-scan, so the crash discarded work already done.
+
+    Catching the write rather than reconfiguring the stream is deliberate:
+    colorama's init() replaces sys.stdout with a wrapper that has no
+    reconfigure(), so a stream-level fix would depend on running first.
+    """
+    try:
+        print(text)
+    except UnicodeEncodeError:
+        encoding = getattr(sys.stdout, "encoding", None) or "ascii"
+        print(text.encode(encoding, errors="replace").decode(encoding, errors="replace"))
+
+
+def _format_intro(use_color: bool) -> str:
+    if not use_color:
+        return f"[+] {INTRO_TEXT}"
+    tag = f"{Style.BRIGHT}{Fore.WHITE}[{Fore.GREEN}+{Fore.WHITE}]{Style.RESET_ALL}"
+    text = f"{Style.BRIGHT}{Fore.GREEN}{INTRO_TEXT}{Style.RESET_ALL}"
+    return f"{tag} {text}"
+
+
+def print_intro_banner(no_color: bool = False, silent: bool = False) -> None:
+    """Print the Maigret intro tagline. Skipped only in silent (--ai) mode."""
+    if silent:
+        return
+    _print_encodable(_format_intro(use_color=not no_color))
+
+
+def _format_donate_banner(use_color: bool) -> str:
+    title = "Support Maigret — sites database & development"
+    link_label = "Donate on Patreon:"
+
+    if not use_color:
+        return f"[♥] {title}\n[♥] {link_label} {PATREON_URL}"
+
+    tag = f"{Style.BRIGHT}{Fore.WHITE}[{Fore.RED}♥{Fore.WHITE}]{Style.RESET_ALL}"
+    title_c = f"{Style.BRIGHT}{Fore.WHITE}{title}{Style.RESET_ALL}"
+    label_c = f"{Style.BRIGHT}{Fore.WHITE}{link_label}{Style.RESET_ALL}"
+    url_c = f"{Style.BRIGHT}{Fore.RED}{PATREON_URL}{Style.RESET_ALL}"
+    return f"{tag} {title_c}\n{tag} {label_c} {url_c}"
+
+
+def print_donate_banner(no_color: bool = False, silent: bool = False) -> None:
+    """Print a colored donation banner. Skipped only in silent (--ai) mode."""
+    if silent:
+        return
+    _print_encodable(_format_donate_banner(use_color=not no_color))

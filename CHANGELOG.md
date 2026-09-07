@@ -1,5 +1,376 @@
 # Changelog
 
+## [0.6.5] - 2026-08-25
+
+### Highlights
+
+Searches no longer fail on a read-only installation. Every run used to end
+with an unconditional write of the sites database back into the package
+directory, so on a distro package, a snap or `/nix/store` it exited with
+`PermissionError` and status 1 — after the report had already been written.
+The write is gone; the only remaining one goes to `~/.maigret`. Affects
+`--no-autoupdate` and offline runs, which is what the documentation
+recommends for containers, CI and air-gapped machines. Landed as part of
+#2973, whose title mentions only the activation tokens.
+
+## What's Changed
+* Bump to 0.6.4 by @soxoj in https://github.com/soxoj/maigret/pull/2960
+* Fix SOCKS5 proxy scheme mismatch between the two HTTP transports by @felicabrera in https://github.com/soxoj/maigret/pull/2966
+* build(deps): bump pyinstaller from 6.21.0 to 6.22.0 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2964
+* Fix ReverbNation false-positive check by @juliosuas in https://github.com/soxoj/maigret/pull/2929
+* Link to the new socid-extractor documentation by @felicabrera in https://github.com/soxoj/maigret/pull/2967
+* Add "Fork me on GitHub" ribbon to web interface by @soxoj in https://github.com/soxoj/maigret/pull/2969
+* build(deps): bump platformdirs from 4.11.1 to 4.11.2 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2970
+* Update of README by @soxoj in https://github.com/soxoj/maigret/pull/2971
+* Fix dev release holding the Latest marker and shadowing branch names by @felicabrera in https://github.com/soxoj/maigret/pull/2963
+* fix: update HuggingFace URL to API endpoint for accurate profile extractions by @kaifcodec in https://github.com/soxoj/maigret/pull/2957
+* Automated Sites List Update by @github-actions[bot] in https://github.com/soxoj/maigret/pull/2972
+* Keep runtime activation tokens out of the sites database by @soxoj in https://github.com/soxoj/maigret/pull/2973
+* Move snapcraft.yaml to snap/ and migrate to core24 by @soxoj in https://github.com/soxoj/maigret/pull/2975
+* Add system settings path and document offline test runs by @soxoj in https://github.com/soxoj/maigret/pull/2974
+* Declare python-dateutil as a direct dependency by @soxoj in https://github.com/soxoj/maigret/pull/2977
+* build(deps): bump aiohttp-socks from 0.11.0 to 0.12.0 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2978
+* build(deps-dev): bump pytest-rerunfailures from 16.4 to 16.5 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2979
+* build(deps): bump platformdirs from 4.11.2 to 4.11.3 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2980
+* Add VNOI, a competitive programming platform in Vietnam by @USERGITHUB1234567 in https://github.com/soxoj/maigret/pull/2965
+* feat: add 6 Chinese sites with presence markers (fixes #2634 v2) by @zsxh1990 in https://github.com/soxoj/maigret/pull/2902
+* build(deps): update chardet requirement from >=7.5.1 to >=7.6.0 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2983
+* build(deps-dev): bump mypy from 2.3.0 to 2.3.1 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2982
+* build(deps): bump svglib from 2.1.0 to 2.2.0 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2981
+* Automated Sites List Update by @github-actions[bot] in https://github.com/soxoj/maigret/pull/2986
+* Remove opensuse.txt by @soxoj in https://github.com/soxoj/maigret/pull/2993
+* Add 8 sites by @soxoj in https://github.com/soxoj/maigret/pull/2990
+* Add 4 sites by @soxoj in https://github.com/soxoj/maigret/pull/2996
+* Fix diagnostic database loading on Windows by @Sushanth012 in https://github.com/soxoj/maigret/pull/2992
+* build(deps): bump pyinstaller from 6.22.0 to 6.22.1 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2987
+* build(deps): bump pyinstaller from 6.22.1 to 6.22.2 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2999
+* build(deps-dev): bump pytest-rerunfailures from 16.5 to 16.6 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2998
+* Add 13 sites by @soxoj in https://github.com/soxoj/maigret/pull/2997
+* Add 9 sites by @soxoj in https://github.com/soxoj/maigret/pull/3001
+* Add 29 sites by @soxoj in https://github.com/soxoj/maigret/pull/3006
+* build(deps): bump lxml from 6.1.1 to 6.1.2 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/3005
+* build(deps): bump curl-cffi from 0.16.0 to 0.16.1 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/3004
+* Add 14 sites by @soxoj in https://github.com/soxoj/maigret/pull/3009
+* fix: write report files with an explicit utf-8 encoding by @ashvinctrl in https://github.com/soxoj/maigret/pull/3007
+* Disable ForumJizni false-positive check by @Sushanth012 in https://github.com/soxoj/maigret/pull/2991
+* Add Coddy and Codédex by @locsucc in https://github.com/soxoj/maigret/pull/2995
+* Automated Sites List Update by @github-actions[bot] in https://github.com/soxoj/maigret/pull/3011
+* False negatives by @soxoj in https://github.com/soxoj/maigret/pull/3012
+
+## New Contributors
+* @USERGITHUB1234567 made their first contribution in https://github.com/soxoj/maigret/pull/2965
+* @locsucc made their first contribution in https://github.com/soxoj/maigret/pull/2995
+
+**Full Changelog**: https://github.com/soxoj/maigret/compare/v0.6.4...v0.6.5
+
+
+## [0.6.4] - 2026-08-11
+
+## What's Changed
+* Bump to 0.6.3 by @soxoj in https://github.com/soxoj/maigret/pull/2863
+* fix: explicit SKIPPED status for Tor/I2P/DNS sites when no proxy is configured by @mvanhorn in https://github.com/soxoj/maigret/pull/2815
+* chore: clean up imports and replace list()[0] with next(iter()) by @odanilosalve in https://github.com/soxoj/maigret/pull/2816
+* build(deps-dev): bump mypy from 2.2.0 to 2.3.0 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2865
+* build(deps): bump asgiref from 3.11.1 to 3.12.1 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2868
+* Fix site checks: 2 fixed, 1 new added + proton activation method by @soxoj in https://github.com/soxoj/maigret/pull/2869
+* Improve CONTRIBUTING.md by @soxoj in https://github.com/soxoj/maigret/pull/2871
+* build(deps-dev): bump coverage from 7.15.1 to 7.15.2 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2875
+* fix: reduce false positives for non-ASCII (Chinese) usernames + add CSDN site by @aznikline in https://github.com/soxoj/maigret/pull/2876
+* Add 21 new sites by @soxoj in https://github.com/soxoj/maigret/pull/2878
+* Automated Sites List Update by @github-actions[bot] in https://github.com/soxoj/maigret/pull/2879
+* Enrichment via socid_extractor url mutations by @soxoj in https://github.com/soxoj/maigret/pull/2880
+* build(deps): bump platformdirs from 4.10.0 to 4.10.1 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2885
+* build(deps): bump yarl from 1.24.2 to 1.24.5 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2883
+* build(deps): bump soupsieve from 2.8.4 to 2.9 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2884
+* Fix site checks: 6 fixed, 4 disabled, 1 dead deleted by @soxoj in https://github.com/soxoj/maigret/pull/2887
+* Automated Sites List Update by @github-actions[bot] in https://github.com/soxoj/maigret/pull/2889
+* Add QQ search via qq_id id type; per-site encoding config by @soxoj in https://github.com/soxoj/maigret/pull/2890
+* Add support of Bilibili by @soxoj in https://github.com/soxoj/maigret/pull/2891
+* Updated AI report prompt for analysis and default model by @soxoj in https://github.com/soxoj/maigret/pull/2888
+* Tag 2210 sites by country and topic by @soxoj in https://github.com/soxoj/maigret/pull/2892
+* Add 11 sites by @soxoj in https://github.com/soxoj/maigret/pull/2893
+* build(deps): bump aiohttp from 3.14.1 to 3.14.2 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2895
+* build(deps): bump pillow from 12.2.0 to 12.3.0 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2896
+* build(deps): bump soupsieve from 2.9 to 2.9.1 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2900
+* build(deps): bump certifi from 2026.6.17 to 2026.7.22 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2899
+* build(deps): bump platformdirs from 4.10.1 to 4.11.0 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2898
+* build(deps): bump aiohttp from 3.14.2 to 3.14.3 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2903
+* build(deps): bump pypdf from 6.13.3 to 6.14.2 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2904
+* Fix site checks: 3 fixed, 2 dead deleted by @soxoj in https://github.com/soxoj/maigret/pull/2909
+* Automated Sites List Update by @github-actions[bot] in https://github.com/soxoj/maigret/pull/2910
+* fix: don't let the SUPPORTED_IDS branch re-add a rejected 'username' value by @ashvinctrl in https://github.com/soxoj/maigret/pull/2907
+* fix: block SSRF / local-file reads via report image URLs during PDF generation by @ashvinctrl in https://github.com/soxoj/maigret/pull/2908
+* Fix site checks: 9 fixed, 1 disabled by @soxoj in https://github.com/soxoj/maigret/pull/2914
+* [ImgBot] Optimize images by @imgbot[bot] in https://github.com/soxoj/maigret/pull/2912
+* fix: disable PulmonaryHypertensionNews (false-positive) by @zsxh1990 in https://github.com/soxoj/maigret/pull/2917
+* Automated Sites List Update by @github-actions[bot] in https://github.com/soxoj/maigret/pull/2921
+* Web interface update: live scan, settings perseistence, history, nagi… by @soxoj in https://github.com/soxoj/maigret/pull/2925
+* fix: don't let the SUPPORTED_IDS branch re-add a rejected username in extract_ids_from_page by @Sanjays2402 in https://github.com/soxoj/maigret/pull/2924
+* Fix Omg.lol false-positive check by @ccyyy1023 in https://github.com/soxoj/maigret/pull/2922
+* build(deps-dev): bump coverage from 7.15.2 to 7.15.3 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2934
+* build(deps): bump cryptography from 48.0.1 to 50.0.0 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2932
+* build(deps): bump svglib from 2.0.2 to 2.1.0 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2933
+* build(deps): bump curl-cffi from 0.15.0 to 0.16.0 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2931
+* Automated Sites List Update by @github-actions[bot] in https://github.com/soxoj/maigret/pull/2935
+* Sponsorship details update in README by @soxoj in https://github.com/soxoj/maigret/pull/2939
+* build(deps-dev): bump coverage from 7.15.3 to 7.15.4 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2946
+* build(deps): bump soupsieve from 2.9.1 to 2.9.2 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2945
+* build(deps): update chardet requirement from >=7.4.3 to >=7.5.1 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2944
+* build(deps): bump pypdf from 6.14.2 to 6.15.0 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2943
+* Fix Instapaper false-positive check by @felicabrera in https://github.com/soxoj/maigret/pull/2937
+* Automated Sites List Update by @github-actions[bot] in https://github.com/soxoj/maigret/pull/2949
+* Fix XMind reports for modern readers by @juliosuas in https://github.com/soxoj/maigret/pull/2930
+* build(deps): bump platformdirs from 4.11.0 to 4.11.1 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2951
+* Improved documentation, added quick link to deploy Maigret web to Readme by @soxoj in https://github.com/soxoj/maigret/pull/2952
+* Update sponsorship information by @soxoj in https://github.com/soxoj/maigret/pull/2953
+* fix: retry transient network/proxy errors in site checkers by @soxoj in https://github.com/soxoj/maigret/pull/2954
+* Fix site checks: 9 fixed, 4 disabled; git hook update by @soxoj in https://github.com/soxoj/maigret/pull/2956
+
+## New Contributors
+* @mvanhorn made their first contribution in https://github.com/soxoj/maigret/pull/2815
+* @zsxh1990 made their first contribution in https://github.com/soxoj/maigret/pull/2917
+* @Sanjays2402 made their first contribution in https://github.com/soxoj/maigret/pull/2924
+* @ccyyy1023 made their first contribution in https://github.com/soxoj/maigret/pull/2922
+* @felicabrera made their first contribution in https://github.com/soxoj/maigret/pull/2937
+
+**Full Changelog**: https://github.com/soxoj/maigret/compare/v0.6.3...v0.6.4
+
+## [0.6.3] - 2026-07-13
+
+## What's Changed
+* Bump to 0.6.2 by @soxoj in https://github.com/soxoj/maigret/pull/2827
+* fix: remove malformed type attribute from html tag in PDF template by @yyq1043-cloud in https://github.com/soxoj/maigret/pull/2806
+* build(deps-dev): bump pytest-rerunfailures from 16.3 to 16.4 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2829
+* build(deps-dev): bump coverage from 7.14.3 to 7.15.0 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2831
+* build(deps): bump typing-extensions from 4.15.0 to 4.16.0 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2832
+* Sponsorship update by @soxoj in https://github.com/soxoj/maigret/pull/2833
+* Fix site checks: 6 fixed, 1 disabled by @soxoj in https://github.com/soxoj/maigret/pull/2834
+* Fix site checks: 13 fixed, 7 disabled + CN sites by @soxoj in https://github.com/soxoj/maigret/pull/2835
+* Fix site checks: 82 fixed, 11 disabled + DiscourseJson engine by @soxoj in https://github.com/soxoj/maigret/pull/2836
+* Add 10 new sites by @soxoj in https://github.com/soxoj/maigret/pull/2839
+* Add 5 new sites by @soxoj in https://github.com/soxoj/maigret/pull/2840
+* Update sponsor info by @soxoj in https://github.com/soxoj/maigret/pull/2841
+* Update README with sponsor info by @soxoj in https://github.com/soxoj/maigret/pull/2854
+* build(deps-dev): bump mypy from 2.1.0 to 2.2.0 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2844
+* fix(data): tag Pixwox with cf_firewall so --cloudflare-bypass triggers by @tgalery in https://github.com/soxoj/maigret/pull/2847
+* Fix site checks: 14 fixed, 5 disabled by @soxoj in https://github.com/soxoj/maigret/pull/2860
+* Automated Sites List Update by @github-actions[bot] in https://github.com/soxoj/maigret/pull/2861
+* build(deps-dev): bump coverage from 7.15.0 to 7.15.1 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2862
+
+## New Contributors
+* @tgalery made their first contribution in https://github.com/soxoj/maigret/pull/2847
+
+**Full Changelog**: https://github.com/soxoj/maigret/compare/v0.6.2...v0.6.3
+
+## [0.6.2] - 2026-07-01
+
+## What's Changed
+* Bump to 0.6.1 by @soxoj in https://github.com/soxoj/maigret/pull/2661
+* Document Tor/proxy usage, add Advanced usage docs section (closes #544) by @soxoj in https://github.com/soxoj/maigret/pull/2663
+* fix(checking): reject URLs and emails extracted as usernames by @soxoj in https://github.com/soxoj/maigret/pull/2673
+* fix(Instagram): refresh rate-limit marker for stale Login title by @soxoj in https://github.com/soxoj/maigret/pull/2674
+* build(deps-dev): bump black from 26.3.1 to 26.5.0 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2676
+* build(deps): bump aiodns from 4.0.0 to 4.0.3 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2677
+* build(deps-dev): bump tuna from 0.5.13 to 0.5.15 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2683
+* build(deps): bump lxml from 6.1.0 to 6.1.1 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2681
+* build(deps-dev): bump black from 26.5.0 to 26.5.1 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2680
+* Added donation links by @soxoj in https://github.com/soxoj/maigret/pull/2686
+* fix(web): sanitize username in report file paths to prevent path traversal by @sebastiondev in https://github.com/soxoj/maigret/pull/2678
+* Added 3 sites by @soxoj in https://github.com/soxoj/maigret/pull/2687
+* build(deps): bump yarl from 1.23.0 to 1.24.2 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2685
+* Windows version improvements and docs by @soxoj in https://github.com/soxoj/maigret/pull/2690
+* Enhance README with AI profiling and analysis details by @soxoj in https://github.com/soxoj/maigret/pull/2691
+* build(deps): bump aiodns from 4.0.3 to 4.0.4 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2684
+* build(deps): bump idna from 3.15 to 3.16 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2692
+* build(deps): bump certifi from 2026.4.22 to 2026.5.20 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2689
+* Add docs FAQ for top search queries; document translation workflow by @soxoj in https://github.com/soxoj/maigret/pull/2694
+* Fix docs build: dedup link targets, gate SVG badges to HTML by @soxoj in https://github.com/soxoj/maigret/pull/2695
+* build(deps-dev): bump pytest-rerunfailures from 16.2 to 16.3 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2698
+* Fix Chinese name false positives: add CJK regexCheck to 27 sites (#2633) by @soxoj in https://github.com/soxoj/maigret/pull/2699
+* Add Cloudflare bypass (FlareSolverr) support to web UI + docs by @soxoj in https://github.com/soxoj/maigret/pull/2700
+* build(deps): bump soupsieve from 2.8.3 to 2.8.4 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2697
+* feature: add keywords parameter and filter by its matching #979 by @dmarakom6 in https://github.com/soxoj/maigret/pull/2702
+* build(deps): bump socid-extractor from 0.0.28 to 0.1.0 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2703
+* build(deps-dev): bump pytest-asyncio from 1.3.0 to 1.4.0 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2704
+* build(deps-dev): bump coverage from 7.14.0 to 7.14.1 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2705
+* build(deps): bump platformdirs from 4.9.6 to 4.10.0 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2708
+* Docker build workflow: update README in DockerHub, change order of labels by @soxoj in https://github.com/soxoj/maigret/pull/2712
+* Dockerhub build update by @soxoj in https://github.com/soxoj/maigret/pull/2713
+* build(deps): bump idna from 3.16 to 3.17 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2711
+* Fix site checks: 4 fixed, 1 disabled by @soxoj in https://github.com/soxoj/maigret/pull/2715
+* Automated Sites List Update by @github-actions[bot] in https://github.com/soxoj/maigret/pull/2716
+* Fix DNS resolver failures: classify aiodns errors, add --dns-resolver threaded fallback (#2688) by @soxoj in https://github.com/soxoj/maigret/pull/2717
+* Graceful Ctrl+C + error UX improvements by @soxoj in https://github.com/soxoj/maigret/pull/2719
+* Automated Sites List Update by @github-actions[bot] in https://github.com/soxoj/maigret/pull/2720
+* Fix site checks: 1 fixed, 8 disabled, 2 added by @soxoj in https://github.com/soxoj/maigret/pull/2722
+* Automated Sites List Update by @github-actions[bot] in https://github.com/soxoj/maigret/pull/2723
+* Added sponsor logo and text to the README files by @soxoj in https://github.com/soxoj/maigret/pull/2728
+* Added sponsor logo and CLI proxy recommendation by @soxoj in https://github.com/soxoj/maigret/pull/2729
+* refactor: update query for leetcode by @kaifcodec in https://github.com/soxoj/maigret/pull/2727
+* Sponsorship text update for README by @soxoj in https://github.com/soxoj/maigret/pull/2730
+* refactor: update instagram entry structure by @kaifcodec in https://github.com/soxoj/maigret/pull/2731
+* Automated Sites List Update by @github-actions[bot] in https://github.com/soxoj/maigret/pull/2733
+* build(deps): bump aiohttp from 3.13.5 to 3.14.0 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2736
+* Update PDF dependency for web variant by @7677865466 in https://github.com/soxoj/maigret/pull/2739
+* build(deps): bump idna from 3.17 to 3.18 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2735
+* Warn on engine dict merge conflicts by @puneetdixit200 in https://github.com/soxoj/maigret/pull/2737
+* Fix site checks: 2 fixed, 2 disabled by @soxoj in https://github.com/soxoj/maigret/pull/2745
+* Refactor error detection and username extraction by @ashton-andersonaap in https://github.com/soxoj/maigret/pull/2701
+* Automated Sites List Update by @github-actions[bot] in https://github.com/soxoj/maigret/pull/2747
+* fix: update_site() now replaces list element instead of local variable by @ashvinctrl in https://github.com/soxoj/maigret/pull/2751
+* build(deps): bump aiohttp from 3.14.0 to 3.14.1 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2748
+* fix: pass value v not key k to is_country_tag in generate_report_context by @ashvinctrl in https://github.com/soxoj/maigret/pull/2753
+* Add Tor entries for Whonix Forum and Stacker News by @nyxst4ck in https://github.com/soxoj/maigret/pull/2755
+* build(deps): bump pypdf from 6.10.2 to 6.12.0 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2767
+* Fix async activation retry handling by @fancyboi999 in https://github.com/soxoj/maigret/pull/2765
+* build(deps-dev): bump pytest from 9.0.3 to 9.1.0 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2772
+* build(deps): bump pyinstaller from 6.20.0 to 6.21.0 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2773
+* fix(data): fix absence string for myjane by @0xseal in https://github.com/soxoj/maigret/pull/2770
+* build(deps): bump cryptography from 46.0.7 to 48.0.1 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2775
+* build(deps): bump pypdf from 6.12.0 to 6.13.0 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2776
+* build(deps): bump svglib from 1.6.0 to 2.0.0 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2777
+* Add AI Wiki links by @soxoj in https://github.com/soxoj/maigret/pull/2778
+* build(deps): bump svglib from 2.0.0 to 2.0.1 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2782
+* docs: fix typos by @juliosuas in https://github.com/soxoj/maigret/pull/2779
+* build(deps): bump certifi from 2026.5.20 to 2026.6.17 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2781
+* Fix HackerNews and Rajce.net false positives by @Ashley-996 in https://github.com/soxoj/maigret/pull/2780
+* build(deps): bump svglib from 2.0.1 to 2.0.2 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2783
+* build(deps): bump pypdf from 6.13.0 to 6.13.3 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2784
+* Update README with sponsorship details by @soxoj in https://github.com/soxoj/maigret/pull/2785
+* ORCID support by @soxoj in https://github.com/soxoj/maigret/pull/2786
+* Automated Sites List Update by @github-actions[bot] in https://github.com/soxoj/maigret/pull/2787
+* Fix error-percentage rounding tripping thresholds at whole-percent granularity by @jichaowang02-lang in https://github.com/soxoj/maigret/pull/2788
+* Code cleanup and refactoring after ponytail audit by @soxoj in https://github.com/soxoj/maigret/pull/2789
+* build(deps-dev): bump pytest from 9.1.0 to 9.1.1 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2793
+* test: cover #2666 TODO-test paths (cookie_jar, extract_ids_from_results) by @aznikline in https://github.com/soxoj/maigret/pull/2795
+* build(deps): update stem requirement from >=1.8.1 to >=1.8.2 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2790
+* build(deps): update chardet requirement from >=5.0.0 to >=7.4.3 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2797
+* refactor: drop dead 'if not dictionary' guards across report paths by @aznikline in https://github.com/soxoj/maigret/pull/2796
+* build(deps-dev): bump coverage from 7.14.1 to 7.14.3 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2798
+* build(deps): update requests-futures requirement from >=1.0.0 to >=1.0.2 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2794
+* build(deps): update mock requirement from >=4.0.3 to >=5.2.0 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2791
+* build(deps): update future requirement from >=0.18.3 to >=1.0.0 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2792
+* Refactor sponsor section in README.md by @soxoj in https://github.com/soxoj/maigret/pull/2799
+* Add archive.org and archive.is links to profile URL blocks by @yyq1043-cloud in https://github.com/soxoj/maigret/pull/2803
+* Fix get_dict_ascii_tree ignoring new_line=False by @jichaowang02-lang in https://github.com/soxoj/maigret/pull/2805
+* Compare raw error percentage against threshold (don't round before the check) by @jichaowang02-lang in https://github.com/soxoj/maigret/pull/2809
+* Fix URLMatcher eating leading host characters (unescaped dots in www./m. prefix) by @jichaowang02-lang in https://github.com/soxoj/maigret/pull/2808
+* fix: preserve report error reasons by @Sushanth012 in https://github.com/soxoj/maigret/pull/2802
+* Add Neo4j Cypher export (--neo4j) by @thunderstornX in https://github.com/soxoj/maigret/pull/2774
+* Added docs for Neo4j integration by @soxoj in https://github.com/soxoj/maigret/pull/2818
+* Make include-tag site filter case-insensitive (match the exclude filter) by @jichaowang02-lang in https://github.com/soxoj/maigret/pull/2811
+* build(deps): bump python-bidi from 0.6.10 to 0.6.11 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2825
+* Fix site checks: 6 fixed, 5 disabled by @soxoj in https://github.com/soxoj/maigret/pull/2826
+
+## New Contributors
+* @sebastiondev made their first contribution in https://github.com/soxoj/maigret/pull/2678
+* @dmarakom6 made their first contribution in https://github.com/soxoj/maigret/pull/2702
+* @kaifcodec made their first contribution in https://github.com/soxoj/maigret/pull/2727
+* @7677865466 made their first contribution in https://github.com/soxoj/maigret/pull/2739
+* @puneetdixit200 made their first contribution in https://github.com/soxoj/maigret/pull/2737
+* @ashton-andersonaap made their first contribution in https://github.com/soxoj/maigret/pull/2701
+* @ashvinctrl made their first contribution in https://github.com/soxoj/maigret/pull/2751
+* @nyxst4ck made their first contribution in https://github.com/soxoj/maigret/pull/2755
+* @fancyboi999 made their first contribution in https://github.com/soxoj/maigret/pull/2765
+* @0xseal made their first contribution in https://github.com/soxoj/maigret/pull/2770
+* @Ashley-996 made their first contribution in https://github.com/soxoj/maigret/pull/2780
+* @jichaowang02-lang made their first contribution in https://github.com/soxoj/maigret/pull/2788
+* @aznikline made their first contribution in https://github.com/soxoj/maigret/pull/2795
+* @yyq1043-cloud made their first contribution in https://github.com/soxoj/maigret/pull/2803
+* @Sushanth012 made their first contribution in https://github.com/soxoj/maigret/pull/2802
+* @thunderstornX made their first contribution in https://github.com/soxoj/maigret/pull/2774
+
+**Full Changelog**: https://github.com/soxoj/maigret/compare/v0.6.1...v0.6.2
+
+## [0.6.1] - 2026-05-15
+
+## What's Changed
+* build(deps): bump pypdf from 6.9.2 to 6.10.0 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2512
+* Fix duplicate attribute initialization in SimpleAiohttpChecker.__init__ by @MichaelMVS in https://github.com/soxoj/maigret/pull/2513
+* Support Python 3.14 in tests by @soxoj in https://github.com/soxoj/maigret/pull/2515
+* build(deps-dev): bump tuna from 0.5.11 to 0.5.13 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2516
+* build(deps): bump lxml from 6.0.3 to 6.0.4 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2519
+* build(deps): bump chardet from 7.4.1 to 7.4.2 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2517
+* build(deps-dev): bump mypy from 1.20.0 to 1.20.1 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2518
+* build(deps): bump pillow from 12.1.1 to 12.2.0 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2520
+* build(deps): bump chardet from 7.4.2 to 7.4.3 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2521
+* build(deps): bump pypdf from 6.10.0 to 6.10.2 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2527
+* Checks fixes by @soxoj in https://github.com/soxoj/maigret/pull/2528
+* Update of Readme and documentation by @soxoj in https://github.com/soxoj/maigret/pull/2514
+* build(deps): bump lxml from 6.0.4 to 6.1.0 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2533
+* Fix site checks: recover 6 CF sites via tls_fingerprint, 500px GraphQ… by @soxoj in https://github.com/soxoj/maigret/pull/2535
+* fix site checks: 14 sites → ip_reputation, 7 disabled, 5 dead deleted by @soxoj in https://github.com/soxoj/maigret/pull/2536
+* Fix site checks: 4 fixed, 14 → ip_reputation, 8 disabled, 5 dead deleted by @soxoj in https://github.com/soxoj/maigret/pull/2537
+* Fix site checks: 3 fixed, 2 → ip_reputation, 7 disabled, 1 dead deleted by @soxoj in https://github.com/soxoj/maigret/pull/2539
+* Add 3 crypto sites (Polymarket, Zora, Revolut.me), added crypto inves… by @soxoj in https://github.com/soxoj/maigret/pull/2538
+* Automated Sites List Update by @github-actions[bot] in https://github.com/soxoj/maigret/pull/2541
+* Fix site checks: 3 fixed, 2 → ip_reputation, 7 disabled, 1 dead deleted by @soxoj in https://github.com/soxoj/maigret/pull/2543
+* Automated Sites List Update by @github-actions[bot] in https://github.com/soxoj/maigret/pull/2545
+* Add OnlyFans with activation mechanism; updated site ranks by @soxoj in https://github.com/soxoj/maigret/pull/2546
+* build(deps-dev): bump mypy from 1.20.1 to 1.20.2 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2547
+* build(deps): bump idna from 3.11 to 3.12 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2548
+* Fix site checks: 3 → ip_reputation, 10 fixed, 6 disabled, 2 dead deleted by @soxoj in https://github.com/soxoj/maigret/pull/2549
+* Fix site checks: 12 fixed, 19 disabled; add new protection tags by @soxoj in https://github.com/soxoj/maigret/pull/2550
+* build(deps): bump certifi from 2026.2.25 to 2026.4.22 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2552
+* AI mode by @soxoj in https://github.com/soxoj/maigret/pull/2529
+* Fix site checks: 4 → ip_reputation, 9 fixed, 16 disabled, 3 dead dele… by @soxoj in https://github.com/soxoj/maigret/pull/2555
+* Fix Google Cloud Shell launch by @soxoj in https://github.com/soxoj/maigret/pull/2557
+* build(deps): bump pyinstaller from 6.19.0 to 6.20.0 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2554
+* build(deps): bump idna from 3.12 to 3.13 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2553
+* test: loosen executor timing upper bounds for slower CI by @juliosuas in https://github.com/soxoj/maigret/pull/2558
+* Fix site checks: 5 fixed; readme fix by @soxoj in https://github.com/soxoj/maigret/pull/2562
+* Add Docker web image with multi-stage building by @soxoj in https://github.com/soxoj/maigret/pull/2564
+* Fix site checks: 7 fixed, 1 disabled by @soxoj in https://github.com/soxoj/maigret/pull/2565
+* Fix site checks: 5 fixed, 4 disabled; fix UA leak bug by @soxoj in https://github.com/soxoj/maigret/pull/2569
+* build(deps): bump arabic-reshaper from 3.0.0 to 3.0.1 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2573
+* Add site checks: 18 new sites by @soxoj in https://github.com/soxoj/maigret/pull/2575
+* Automated Sites List Update by @github-actions[bot] in https://github.com/soxoj/maigret/pull/2576
+* build(deps): bump reportlab from 4.4.10 to 4.5.0 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2578
+* Fix ID extraction crash when regex groups are optional by @egrezeli in https://github.com/soxoj/maigret/pull/2572
+* Update CONTRIBUTING.md with instructions for developers by @soxoj in https://github.com/soxoj/maigret/pull/2589
+* Fix outdated Google Colab setup and dependency installation by @SayanDey322 in https://github.com/soxoj/maigret/pull/2591
+* fix: disable RomanticCollection check by @juliosuas in https://github.com/soxoj/maigret/pull/2588
+* docs: add Simplified Chinese (zh-CN) README translation by @whtis in https://github.com/soxoj/maigret/pull/2606
+* Automated Sites List Update by @github-actions[bot] in https://github.com/soxoj/maigret/pull/2607
+* Improve startup error message for missing dependencies by @SayanDey322 in https://github.com/soxoj/maigret/pull/2593
+* Modernize python package workflow by @SayanDey322 in https://github.com/soxoj/maigret/pull/2594
+* Fix site checks: 8 → ip_reputation, 6 fixed, 9 disabled, 1 dead deleted by @soxoj in https://github.com/soxoj/maigret/pull/2611
+* Reddit fix by @soxoj in https://github.com/soxoj/maigret/pull/2614
+* Automated Sites List Update by @github-actions[bot] in https://github.com/soxoj/maigret/pull/2615
+* Fix site checks: 7 fixed, 1 disabled, 1 dead deleted by @soxoj in https://github.com/soxoj/maigret/pull/2616
+* Fixed duplicates of YouTube and Periscope by @soxoj in https://github.com/soxoj/maigret/pull/2618
+* Fix network graph height to be viewport-responsive instead of fixed 750px by @SayanDey322 in https://github.com/soxoj/maigret/pull/2590
+* Add web interface tests by @soxoj in https://github.com/soxoj/maigret/pull/2619
+* refactor:reduces the cognitive complexity of get_ai_analysis by @odanilosalve in https://github.com/soxoj/maigret/pull/2581
+* AI mode documentation by @soxoj in https://github.com/soxoj/maigret/pull/2620
+* build(deps): bump python-bidi from 0.6.7 to 0.6.9 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2622
+* build(deps-dev): bump mypy from 1.20.2 to 2.0.0 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2625
+* Cloudflare bypass webgate by @soxoj in https://github.com/soxoj/maigret/pull/2628
+* Fix context field using class instead of instance in error handling by @disappear00 in https://github.com/soxoj/maigret/pull/2627
+* Add test for CheckError bug by @soxoj in https://github.com/soxoj/maigret/pull/2631
+* Update download badge links in README.md by @soxoj in https://github.com/soxoj/maigret/pull/2636
+* fix(security): harden /reports path containment via send_from_directory by @aaronjmars in https://github.com/soxoj/maigret/pull/2635
+* build(deps-dev): bump coverage from 7.13.5 to 7.14.0 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2638
+* build(deps): bump idna from 3.13 to 3.14 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2639
+* Update links to the community Telegram bot by @soxoj in https://github.com/soxoj/maigret/pull/2641
+* build(deps): bump urllib3 from 2.6.3 to 2.7.0 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2642
+* build(deps-dev): bump mypy from 2.0.0 to 2.1.0 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2644
+* Refresh stale Duolingo usernameClaimed sample (blue → duolingo) by @razbenya in https://github.com/soxoj/maigret/pull/2650
+* Fix linktr.ee detector (status_code, not stale message check) by @razbenya in https://github.com/soxoj/maigret/pull/2649
+* Apply --proxy to CurlCffiChecker (tls_fingerprint sites) by @razbenya in https://github.com/soxoj/maigret/pull/2648
+* Refresh stale Gravatar usernameClaimed sample (blue → automattic) by @razbenya in https://github.com/soxoj/maigret/pull/2651
+* Add regression tests for CurlCffiChecker proxy forwarding (#2648 follow-up) by @razbenya in https://github.com/soxoj/maigret/pull/2652
+* build(deps): bump idna from 3.14 to 3.15 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2647
+* build(deps): bump reportlab from 4.5.0 to 4.5.1 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2645
+* build(deps): bump requests from 2.33.1 to 2.34.1 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2656
+* build(deps-dev): bump pytest-rerunfailures from 16.1 to 16.2 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2654
+* build(deps): bump python-bidi from 0.6.9 to 0.6.10 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2655
+* Make xhtml2pdf optional, fix install on Linux without libcairo by @soxoj in https://github.com/soxoj/maigret/pull/2659
+* build(deps): bump requests from 2.34.1 to 2.34.2 by @dependabot[bot] in https://github.com/soxoj/maigret/pull/2658
+* Fix site checks: 2 fixed, 3 disabled; add Faceit; fix utils import by @soxoj in https://github.com/soxoj/maigret/pull/2660
+
+**Full Changelog**: https://github.com/soxoj/maigret/compare/v0.6.0...v0.6.1
+
 ## [0.6.0] - 2025-04-10
 
 ## What's Changed

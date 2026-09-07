@@ -5,6 +5,10 @@ from typing import List
 
 SETTINGS_FILES_PATHS = [
     path.join(path.dirname(path.realpath(__file__)), "resources/settings.json"),
+    # System-wide policy. Lets an administrator or a distribution package
+    # configure Maigret without editing inside the installed package, whose
+    # directory is read-only on a system-wide install anyway.
+    '/etc/maigret/settings.json',
     path.expanduser('~/.maigret/settings.json'),
     path.join(os.getcwd(), 'settings.json'),
 ]
@@ -42,11 +46,13 @@ class Settings:
     pdf_report: bool
     html_report: bool
     graph_report: bool
+    neo4j_report: bool
     md_report: bool
     web_interface_port: int
     no_autoupdate: bool
     db_update_meta_url: str
     autoupdate_check_interval_hours: int
+    cloudflare_bypass: dict
 
     # submit mode settings
     presence_strings: list

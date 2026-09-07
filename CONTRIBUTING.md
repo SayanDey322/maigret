@@ -50,7 +50,7 @@ The most useful work in this project is keeping checks accurate over time. Sites
 
 **Where to start.** Good candidates:
 
-- Issues with the `false-positive` label, especially those opened automatically by the Telegram bot.
+- Issues with the `false-positive` label.
 - Sites currently `disabled: true` in `data.json` — many were disabled on a transient symptom and have since healed.
 - Sites for which `--self-check --diagnose` reports a problem.
 - A focused audit of one engine (vBulletin, XenForo, phpBB, Discourse, Flarum, ...). Engine-wide breakage usually has a single root cause and several sites can be fixed in one PR.
@@ -97,6 +97,16 @@ Each site entry uses one of three `checkType` modes to decide whether a profile 
 
 Full reference for `checkType`, `urlProbe`, `engine`, and the rest of the `data.json` schema is in the [development guide](docs/source/development.rst), section *How to fix false-positives*.
 
+### SPA / JS-rendered sites
+
+Modern sites often render the profile client-side, so a plain HTTP fetch returns an empty shell that trips both `message` and `status_code` checks. **Don't reach for a headless browser** — it's a heavy dependency for a problem that has three lighter answers. Work down the ladder in order:
+
+1. **XHR / GraphQL / RSC endpoint → `urlProbe`.** Open the profile in Chrome DevTools → Network, filter to `XHR`/`Fetch`, and look for the request that carries the actual profile JSON. Almost every SPA has one — that's what its own front-end calls. Put its URL in `urlProbe`; the human-readable profile URL stays in `url`. Watch for versioned APIs (`/v5/`, `/api/v2/`) — if the one you find starts returning 5xx or 404 for everyone, bump the version before disabling.
+2. **JS-cookie / anti-bot challenge → `activation` handler.** If the first response is a challenge stub that sets a cookie via JavaScript and reloads, add a static method to `maigret/activation.py` that reproduces the token exchange with plain `aiohttp` (existing examples: `wikimapia`, `weibo`, `twitter`, `vimeo`, `onlyfans`, `proton`). Point `activation.method` at your function name and set `marks` to the challenge substring; Maigret retries the check once after `activation` fires.
+3. **TLS-fingerprint block → `protection: ["tls_fingerprint"]`.** If the site 403's or serves a Cloudflare interstitial to plain `aiohttp` but works in a real browser, the check is being killed by JA3/JA4 fingerprinting. The tag routes the request through a Chrome-impersonating client — usually enough on its own, with no `disabled: true` needed.
+
+If none of these help — the site really does need a full JS runtime with DOM to render the profile signal — that's a case for issue [#579](https://github.com/soxoj/maigret/issues/579). Open a fresh issue naming the site so we can weigh a `checkType: browser` mode against its latency and dependency cost.
+
 ### Editing `data.json` safely
 
 `data.json` is a single ~36 000-line JSON file. **Make surgical, line-level edits only.** Never rewrite it by reading it into a Python dict and dumping it back — `json.load` + `json.dump` reformats every entry and produces an unreviewable 70 000-line diff. The same rule applies to any helper script that touches the file: it must preserve the original formatting of untouched entries.
@@ -128,6 +138,17 @@ If the second command reports `[+]` for the fake username, the check is a false 
 - **Category tags** must come from the canonical `"tags"` array at the bottom of `data.json`. The `test_tags_validity` test fails if you introduce an unregistered tag. If no existing tag fits well, either pick the closest reasonable match or add the new tag to the canonical list as an explicit, separate change. Don't use platform names (`writefreely`, `pixelfed`) — use category names (`blog`, `photo`).
 
 - **Protection tags** (`tls_fingerprint`, `ip_reputation`, `cf_js_challenge`, `cf_firewall`, `aws_waf_js_challenge`, `ddos_guard_challenge`, `js_challenge`, `custom_bot_protection`) describe the kind of anti-bot protection a site uses. One of them — **`tls_fingerprint`** — is load-bearing: when a site fingerprints the TLS handshake (JA3/JA4) and blocks non-browser clients, tagging it with `tls_fingerprint` makes Maigret automatically swap its HTTP client to [`curl_cffi`](https://github.com/lexiforest/curl_cffi) with Chrome browser emulation, which is usually enough to pass. The site stays `enabled` — no `disabled: true` is needed. Examples: Instagram, NPM, Codepen, Kickstarter, Letterboxd. The remaining tags are documentation-only and pair with `disabled: true` until a per-provider solver is integrated. The full taxonomy and the rules for picking the right tag are in the [development guide](docs/source/development.rst), section *protection (site protection tracking)*. Don't add a protection tag without empirical evidence it applies in the current environment.
+
+## Editing documentation
+
+The docs under `docs/source/` use Sphinx (reStructuredText) with a Simplified Chinese translation in `docs/source/locale/zh_CN/`. **If you edit any `.rst` file, refresh the translation catalogs so the Chinese build does not silently fall back to English on the changed strings:**
+
+```bash
+cd docs
+make intl-update LANG=zh_CN
+```
+
+This regenerates the `.po` files — new strings appear with empty `msgstr ""` and changed ones get a `#, fuzzy` marker. Translating them is optional for a PR (a maintainer or translator can fill them in later), but committing the regenerated `.po` files is **not** optional — otherwise the next person who runs `intl-update` gets a noisy diff for changes that aren't theirs. Full workflow, CJK-specific gotchas, and how to add a new language: [development guide](docs/source/development.rst), section *Translations*.
 
 ## Testing
 

@@ -11,6 +11,67 @@ Usernames
 You can specify several usernames separated by space. Usernames are
 **not** mandatory as there are other operations modes (see below).
 
+.. _identifiers-from-a-file:
+
+Identifiers from a file
+-----------------------
+
+``maigret --input-file ids.txt``
+
+Reads identifiers from a file, one per line, and searches them exactly like
+positional ones. A single ``-`` as the path reads standard input instead, so a
+generator can be piped straight in. Blank lines and lines starting with ``#``
+are skipped.
+
+Every line is searched as the type given by ``--id-type``, which is
+``username`` unless you change it. A line can also carry its own type as an
+``id_type:value`` prefix, and that is how one run can mix usernames with social
+network ids.
+
+For example, ``ids.txt``:
+
+.. code-block:: text
+
+   # usernames from a generator
+   john
+   jsmith
+   john.smith
+
+   # ids of a known type
+   vk_id:12345
+   gaia_id:109876543210
+
+Then run Maigret against it:
+
+.. code-block:: bash
+
+   maigret --input-file ids.txt --html
+
+Every line is searched with the type Maigret picked for it, and the type is
+printed as it goes:
+
+.. code-block:: text
+
+   [*] Checking username john on:
+   [*] Checking username jsmith on:
+   [*] Checking username john.smith on:
+   [*] Checking vk_id 12345 on:
+   [*] Checking gaia_id 109876543210 on:
+
+A generator can also be piped in directly, without a file in between:
+
+.. code-block:: bash
+
+   ./generate-usernames.py john.smith | maigret --input-file - --html
+
+Mixing types in one run is worth it because everything found lands in a single
+report and a single connections graph, while separate runs give you separate
+ones.
+
+Note that ``--permute`` applies to positional usernames only. Names coming from
+a file are searched as they are written, because a file can hold thousands of
+lines and permuting those is rarely what you want.
+
 Parsing of account pages and online documents
 ---------------------------------------------
 
@@ -63,6 +124,33 @@ from slow sites. On the other hand, this may cause a long delay to
 gather all results. The choice of the right timeout should be carried
 out taking into account the bandwidth of the Internet connection.
 
+Network and proxy options
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``--proxy PROXY_URL`` / ``-p PROXY_URL`` - Route **every** check through
+the given HTTP or SOCKS proxy. Example: ``socks5://127.0.0.1:1080``,
+``http://user:pass@proxy.example:3128``. This is the flag to use for
+routing the whole run through Tor (``--proxy socks5://127.0.0.1:9050``),
+a residential proxy, or any corporate gateway. No default.
+
+``socks5://`` and ``socks5h://`` are interchangeable: Maigret rewrites the
+scheme to the spelling expected by the transport handling each site, so
+either one resolves hostnames **at the proxy** for the whole database.
+
+``--tor-proxy TOR_PROXY_URL`` - Gateway used **only** for ``.onion``
+sites in the database **(default: socks5://127.0.0.1:9050)**. Clearweb
+sites are unaffected — for them Maigret uses your direct connection or
+``--proxy`` if you set one. Without this flag, ``.onion`` sites are
+silently skipped.
+
+``--i2p-proxy I2P_PROXY_URL`` - Gateway used **only** for ``.i2p``
+sites in the database **(default: http://127.0.0.1:4444)**. Same
+"only matching protocol" rule as ``--tor-proxy``.
+
+Maigret does not start the Tor or I2P daemon for you — launch it first.
+For a full walkthrough (Tor Browser vs system ``tor`` port numbers,
+Tails OS recipe, timeout/retry tuning), see :doc:`tor-and-proxies`.
+
 ``--cookies-jar-file`` - File with custom cookies in Netscape format
 (aka cookies.txt). You can install an extension to your browser to
 download own cookies (`Chrome <https://chrome.google.com/webstore/detail/get-cookiestxt/bgaddhkoddajcdgocldbbfleckgcbcid>`_, `Firefox <https://addons.mozilla.org/en-US/firefox/addon/cookies-txt/>`_).
@@ -74,9 +162,13 @@ recursive search by them.
 false positives).
 
 ``--id-type`` - Specify identifier(s) type (default: username).
-Supported types: gaia_id, vk_id, yandex_public_id, ok_id, wikimapia_uid.
-Currently, you must add ``-a`` flag to run a scan on sites with custom
-id types, sites will be filtered automatically.
+Supported types: gaia_id, steam_id, vk_id, yandex_public_id, ok_id,
+wikimapia_uid, uidme_uguid, yelp_userid, orcid, qq_id, bilibili_id.
+Sites whose type does not match are filtered out automatically. See
+:ref:`supported-identifier-types` for details and an example.
+
+``--input-file`` - Read identifiers from a file, one per line. See
+:ref:`identifiers-from-a-file` above.
 
 ``--ignore-ids`` - Do not make search by the specified username or other
 ids. Useful for repeated scanning with found known irrelevant usernames.
@@ -94,6 +186,25 @@ the run after the explicit update finishes.
 
 ``--retries RETRIES`` - Count of attempts to restart temporarily failed
 requests.
+
+``--with-domains`` *(experimental)* - Also resolve a small set of
+``{username}.<tld>`` patterns through DNS (A-records) in parallel with
+the normal HTTP checks. Currently 7 entries in the database use this
+path (``.ddns.net``, ``.com``, ``.pro``, ``.me``, ``.biz``, ``.email``,
+``.guru``). DNS-only hits can include parking domains and catch-all
+wildcards, so treat results as a lead rather than confirmation.
+See the :doc:`FAQ entry on DNS domain checks <faq>`.
+
+``--cloudflare-bypass`` *(experimental)* - Route checks for sites tagged
+``protection: ["cf_js_challenge"]`` / ``["cf_firewall"]`` / ``["webgate"]``
+through a local Chrome-based solver (FlareSolverr by default). The bypass
+is opt-in — without this flag (or
+``settings.cloudflare_bypass.enabled = true``) those sites are checked
+the usual way, which Cloudflare almost always blocks: you get an UNKNOWN
+status with a JS-challenge / firewall error rather than a real result.
+Configure the backend in ``settings.cloudflare_bypass.modules``.
+See :ref:`cloudflare-bypass`. **Experimental** — the flag, schema and
+routing rules may change without backwards-compatibility guarantees.
 
 .. _custom-database:
 
@@ -148,8 +259,8 @@ usernames).
 ``-H``, ``--html`` - Generate an HTML report file (general report on all
 usernames).
 
-``-X``, ``--xmind`` - Generate an XMind 8 mindmap (one report per
-username).
+``-X``, ``--xmind`` - Generate a legacy XML XMind mindmap with a manifest for
+modern readers (one report per username).
 
 ``-C``, ``--csv`` - Generate a CSV report (one report per username).
 
@@ -161,8 +272,26 @@ ndjson (one report per username). E.g. ``--json ndjson``
 ``-M``, ``--md`` - Generate a Markdown report (general report on all
 usernames). See :ref:`markdown-report` below.
 
+``--neo4j`` - Generate a Neo4j Cypher report: a ``.cypher`` script that
+recreates the maigret graph (the same one produced by ``--graph``) in a
+Neo4j database, importable with ``cypher-shell`` or the Neo4j Browser
+(general report on all usernames). See :ref:`neo4j-export` below.
+
+``--ai`` - Run an AI-powered analysis of the search results using an
+OpenAI-compatible chat completion API. The internal Markdown report is
+sent to the model, which returns a short investigation summary that is
+streamed to the terminal. See :ref:`ai-analysis` below.
+
+``--ai-model`` - Model name to use with ``--ai``. Defaults to
+``openai_model`` from settings (``gpt-4o`` out of the box).
+
 ``-fo``, ``--folderoutput`` - Results will be saved to this folder,
 ``results`` by default. Will be created if doesn’t exist.
+
+``--web PORT`` - Start the built-in web interface on the given port and
+serve results / downloadable reports from a single page. Example:
+``maigret --web 5000`` → open ``http://127.0.0.1:5000``. Full
+walkthrough with screenshots: :ref:`web-interface`.
 
 Output options
 --------------
@@ -241,4 +370,112 @@ The Markdown format is optimized for LLM context windows. You can feed the repor
    cat reports/report_johndoe.md | llm "Analyze this OSINT report and summarize key findings"
 
 The structured Markdown with per-site sections makes it easy for AI tools to extract relationships, cross-reference identities, and identify patterns across accounts.
+
+For a built-in alternative that calls the model for you and prints the
+summary directly, see :ref:`ai-analysis` below.
+
+.. _ai-analysis:
+
+AI analysis (built-in)
+----------------------
+
+The ``--ai`` flag turns the search results into a short investigation
+summary by sending the internal Markdown report to an OpenAI-compatible
+chat completion API and streaming the model's reply to the terminal.
+
+.. code-block:: console
+
+   export OPENAI_API_KEY=sk-...
+   maigret username --ai
+
+   # use a smaller / cheaper model
+   maigret username --ai --ai-model gpt-4o-mini
+
+While ``--ai`` is active, per-site progress lines and the short text
+report at the end are suppressed so the streamed summary is the main
+output. The Markdown report itself is built in memory and is **not**
+written to disk by ``--ai`` alone — combine with ``--md`` if you also
+want the file on disk.
+
+The summary follows a fixed format with sections for the most likely
+real name, location, occupation, interests, languages, main website,
+username variants, number of platforms, active years, a confidence
+rating, and a short list of follow-up leads. The model is instructed
+to rely only on what is supported by the report and to avoid mixing
+clearly unrelated profiles into the main identity.
+
+**Configuration.** The API key is resolved from
+``settings.openai_api_key`` first, then from the ``OPENAI_API_KEY``
+environment variable. The endpoint defaults to
+``https://api.openai.com/v1`` and can be redirected to any
+OpenAI-compatible service (Azure OpenAI, OpenRouter, a local server,
+…) by setting ``openai_api_base_url`` in ``settings.json``. See
+:ref:`settings` for the full list of options.
+
+.. note::
+
+   ``--ai`` makes a network request to the configured chat completion
+   endpoint and sends the full Markdown report (which contains the
+   gathered profile data). Use it only with providers and accounts
+   you trust with that data.
+
+.. _neo4j-export:
+
+Neo4j export
+------------
+
+The ``--neo4j`` flag serializes the maigret graph — the same nodes and
+relationships behind ``--graph`` — into a ``*_neo4j.cypher`` script you
+can load into a `Neo4j <https://neo4j.com/>`_ database for querying and
+visual exploration of how identities, accounts, sites, and extracted
+data points link together.
+
+.. code-block:: console
+
+   maigret username --neo4j
+
+This writes ``reports/report_username_neo4j.cypher``. No extra runtime
+dependency is required (it reuses the ``networkx`` graph that ``--graph``
+already builds).
+
+**What the script contains.**
+
+- A ``CREATE CONSTRAINT ... IF NOT EXISTS`` ensuring the ``name``
+  property of every ``:MaigretNode`` is unique.
+- One ``MERGE`` per node. Each node carries three properties:
+  ``name`` (the unique key, e.g. ``account: https://github.com/user``),
+  ``type`` (``username``, ``account``, ``fullname``, ``uid``, …) and
+  ``label`` (the human-readable value).
+- One ``MERGE`` per edge as a ``[:LINKED_TO]`` relationship.
+
+Because every node and edge is ``MERGE``-d on its unique key, importing
+the same report twice is **idempotent** — it updates existing nodes
+instead of creating duplicates.
+
+**Importing.**
+
+.. code-block:: console
+
+   # via cypher-shell (Neo4j must be running; default Bolt port 7687)
+   cypher-shell -u neo4j -p <password> < reports/report_username_neo4j.cypher
+
+Alternatively, open the Neo4j Browser at ``http://localhost:7474`` and
+paste the script contents into the query editor. Drop the ``-p`` flag if
+authentication is disabled, or let ``cypher-shell`` prompt for the
+password interactively.
+
+**Exploring the graph.** Once imported, inspect it with Cypher, e.g.:
+
+.. code-block:: cypher
+
+   // show the whole graph
+   MATCH (n:MaigretNode)-[r:LINKED_TO]->(m) RETURN n, r, m;
+
+   // accounts linked to a given username
+   MATCH (u:MaigretNode {type: 'username'})-[:LINKED_TO]->(a:MaigretNode {type: 'account'})
+   RETURN u.label, a.label;
+
+The ``CREATE CONSTRAINT ... IF NOT EXISTS FOR ... REQUIRE`` syntax
+requires Neo4j 4.4+; the ``MERGE`` statements themselves work on any
+version.
 

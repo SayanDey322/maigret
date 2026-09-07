@@ -1,10 +1,11 @@
 """Maigret Database test functions"""
 
+import logging
 import re
 
 from typing import Any, Dict
 
-from maigret.sites import MaigretDatabase, MaigretSite
+from maigret.sites import MaigretDatabase, MaigretEngine, MaigretSite
 
 EXAMPLE_DB: Dict[str, Any] = {
     'engines': {
@@ -114,13 +115,52 @@ def test_saving_site_error():
     assert amperka.strip_engine_data().json['errors'] == {'error1': 'text1'}
 
 
+def test_update_from_engine_warns_on_conflicting_dict_entries(caplog):
+    site = MaigretSite(
+        'Example',
+        {
+            'urlMain': 'https://example.com',
+            'url': 'https://example.com/{username}',
+            'errors': {
+                'Shared marker': 'site value',
+                'Same marker': 'same value',
+            },
+        },
+    )
+    engine = MaigretEngine(
+        'ExampleEngine',
+        {
+            'site': {
+                'errors': {
+                    'Shared marker': 'engine value',
+                    'Same marker': 'same value',
+                    'Engine marker': 'engine-only value',
+                },
+            },
+        },
+    )
+
+    with caplog.at_level(logging.WARNING):
+        site.update_from_engine(engine)
+
+    assert site.errors == {
+        'Shared marker': 'engine value',
+        'Same marker': 'same value',
+        'Engine marker': 'engine-only value',
+    }
+    assert 'Example' in caplog.text
+    assert 'errors' in caplog.text
+    assert 'Shared marker' in caplog.text
+    assert 'Same marker' not in caplog.text
+
+
 def test_site_url_detector():
     db = MaigretDatabase()
     db.load_from_json(EXAMPLE_DB)
 
     assert (
         db.sites[0].url_regexp.pattern
-        == r'^https?://(www.|m.)?forum\.amperka\.ru/members/\?username=(.+?)$'
+        == r'^https?://(www\.|m\.)?forum\.amperka\.ru/members/\?username=(.+?)$'
     )
     assert (
         db.sites[0].detect_username('http://forum.amperka.ru/members/?username=test')
@@ -140,6 +180,21 @@ def test_extract_id_from_url_skips_none_groups():
 
     assert site.extract_id_from_url("https://example.com/username") == (
         "username",
+        "username",
+    )
+
+
+def test_extract_id_from_url_handles_literal_dollar_prefix():
+    site = MaigretSite(
+        "Cash App",
+        {
+            "urlMain": "https://cash.app",
+            "url": "https://cash.app/${username}",
+        },
+    )
+
+    assert site.extract_id_from_url("https://cash.app/$alice") == (
+        "alice",
         "username",
     )
 
@@ -216,13 +271,32 @@ def test_ranked_sites_dict_excluded_tags():
     assert list(db.ranked_sites_dict(excluded_tags=['ucoz']).keys()) == ['1', '2']
 
     # combining include and exclude tags
-    assert list(db.ranked_sites_dict(tags=['forum'], excluded_tags=['ru']).keys()) == ['1']
+    assert list(db.ranked_sites_dict(tags=['forum'], excluded_tags=['ru']).keys()) == [
+        '1'
+    ]
 
     # excluding non-existent tag has no effect
-    assert list(db.ranked_sites_dict(excluded_tags=['nonexistent']).keys()) == ['1', '2', '3']
+    assert list(db.ranked_sites_dict(excluded_tags=['nonexistent']).keys()) == [
+        '1',
+        '2',
+        '3',
+    ]
 
     # exclude all
     assert list(db.ranked_sites_dict(excluded_tags=['forum', 'ucoz']).keys()) == []
+
+
+def test_ranked_sites_dict_tag_filter_is_case_insensitive():
+    # The include (whitelist) tag filter must be case-insensitive, like the
+    # exclude (blacklist) filter and every sibling lambda (name/source/engine),
+    # all of which lowercase the site-side value. A site tagged 'US' must be
+    # found by tags=['us'] just as it is excluded by excluded_tags=['us'].
+    db = MaigretDatabase()
+    db.update_site(MaigretSite('1', {'alexaRank': 2, 'tags': ['US']}))
+
+    assert list(db.ranked_sites_dict(tags=['us']).keys()) == ['1']
+    # the blacklist already treats the same tag case-insensitively
+    assert list(db.ranked_sites_dict(excluded_tags=['us']).keys()) == []
 
 
 def test_ranked_sites_dict_excluded_tags_with_top():
@@ -232,7 +306,15 @@ def test_ranked_sites_dict_excluded_tags_with_top():
         MaigretSite('Parent', {'alexaRank': 1, 'tags': ['forum'], 'type': 'username'})
     )
     db.update_site(
-        MaigretSite('Mirror', {'alexaRank': 999999, 'source': 'Parent', 'tags': ['forum'], 'type': 'username'})
+        MaigretSite(
+            'Mirror',
+            {
+                'alexaRank': 999999,
+                'source': 'Parent',
+                'tags': ['forum'],
+                'type': 'username',
+            },
+        )
     )
     db.update_site(
         MaigretSite('Other', {'alexaRank': 2, 'tags': ['coding'], 'type': 'username'})
@@ -314,6 +396,30 @@ def test_get_url_template():
         },
     )
     assert site.get_url_template() == "SUBDOMAIN"
+
+
+def test_update_site_replaces_existing_entry():
+    """update_site() must replace the list element, not just rebind a loop variable."""
+    db = MaigretDatabase()
+    db.update_site(MaigretSite('Example', {'urlMain': 'https://example.com', 'disabled': False}))
+
+    updated = MaigretSite('Example', {'urlMain': 'https://example.com', 'disabled': True})
+    db.update_site(updated)
+
+    # The database must contain exactly one entry and it must be the updated one
+    assert len(db.sites) == 1
+    assert db.sites_dict['Example'].disabled is True
+
+
+def test_update_site_appends_when_name_not_found():
+    """update_site() must append when no site with that name exists."""
+    db = MaigretDatabase()
+    db.update_site(MaigretSite('Alpha', {'urlMain': 'https://alpha.com'}))
+    db.update_site(MaigretSite('Beta', {'urlMain': 'https://beta.com'}))
+
+    assert len(db.sites) == 2
+    assert 'Alpha' in db.sites_dict
+    assert 'Beta' in db.sites_dict
 
 
 def test_has_site_url_or_name(default_db):

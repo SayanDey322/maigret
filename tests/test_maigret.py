@@ -1,13 +1,14 @@
 """Maigret main module test functions"""
 
 import asyncio
+import json
+import os
 import copy
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
-from mock import Mock
 
-from maigret.maigret import self_check, maigret
+from maigret.maigret import self_check, maigret, save_db_safely
 from maigret.maigret import (
     extract_ids_from_page,
     extract_ids_from_results,
@@ -193,12 +194,138 @@ def test_extract_ids_from_page(test_db):
     }
 
 
-def test_extract_ids_from_results(test_db):
+def test_extract_ids_from_results_aggregates_usernames_and_links(default_db):
+    """Covers the recursive ID-extraction path flagged at maigret.py:946
+    (`# TODO: tests`, `if recursive_search_enabled: extract_ids_from_results(...)`).
+
+    The previous incarnation of this test was a bare expression
+    (`extract_ids_from_results(...) == {...}`) with no `assert`, so it silently
+    passed regardless of the return value. It also pinned the result against
+    `test_db` (tests/db.json), whose site set never matched the Reddit URL and
+    thus returned `{'test1': ...}` — silently dropping `test2`. Restored here as
+    a real assertion against `default_db`, which carries the Reddit URL pattern.
+    """
     TEST_EXAMPLE: dict = copy.deepcopy(RESULTS_EXAMPLE)
     TEST_EXAMPLE['Reddit']['ids_usernames'] = {'test1': 'yandex_public_id'}
     TEST_EXAMPLE['Reddit']['ids_links'] = ['https://www.reddit.com/user/test2']
 
-    extract_ids_from_results(TEST_EXAMPLE, test_db) == {
+    assert extract_ids_from_results(TEST_EXAMPLE, default_db) == {
         'test1': 'yandex_public_id',
         'test2': 'username',
     }
+
+
+def test_extract_ids_from_results_merges_ids_usernames_across_sites(default_db):
+    """ids_usernames from every site must be merged into the result dict,
+    keyed by username with the per-site id type as the value."""
+    example = {
+        'SiteA': {'ids_usernames': {'alice': 'username', 'bob': 'telegram'}},
+        'SiteB': {'ids_usernames': {'carol': 'username'}},
+    }
+    assert extract_ids_from_results(example, default_db) == {
+        'alice': 'username',
+        'bob': 'telegram',
+        'carol': 'username',
+    }
+
+
+def test_extract_ids_from_results_skips_empty_site_entry(default_db):
+    """A site whose result dict is empty (`{}`) must be skipped via
+    `if not dictionary: continue` rather than raising on the subsequent
+    `.get('ids_usernames')` / `.get('ids_links')` calls."""
+    example = {
+        'EmptySite': {},
+        'SiteA': {'ids_usernames': {'alice': 'username'}},
+    }
+    assert extract_ids_from_results(example, default_db) == {'alice': 'username'}
+
+
+def test_extract_ids_from_results_empty_input_returns_empty(default_db):
+    """No sites searched → no extracted ids. Guards against accidental
+    KeyError / iteration over None."""
+    assert extract_ids_from_results({}, default_db) == {}
+
+
+# -----------------------------------------------------------------------------
+# Ctrl+C handling (https://github.com/soxoj/maigret/issues from
+# "two presses needed to exit + traceback"). The contract:
+#
+#   1. First Ctrl+C during a running search → cancel that search but proceed
+#      to report generation with whatever was collected.
+#   2. Any KeyboardInterrupt that escapes to __main__.py (e.g. second Ctrl+C
+#      during the report write, or interrupt before the search loop runs)
+#      must exit with the conventional SIGINT code (130) and a one-line
+#      message — never a Python traceback.
+# -----------------------------------------------------------------------------
+
+
+def test_main_entrypoint_handles_top_level_keyboard_interrupt_cleanly():
+    """Verify the __main__.py wrapper around asyncio.run catches
+    KeyboardInterrupt and exits with code 130 + a clean message. We can't
+    SIGINT the test process itself without disrupting pytest's signal
+    handlers, so we drive __main__.py in a subprocess with asyncio.run
+    monkey-patched to raise KeyboardInterrupt directly."""
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    repo_root = Path(__file__).resolve().parents[1]
+    script = (
+        "import asyncio, sys, runpy\n"
+        # Simulate the second-Ctrl+C-during-asyncio.run path:
+        "def _raise(*a, **kw):\n"
+        "    raise KeyboardInterrupt()\n"
+        "asyncio.run = _raise\n"
+        # run_module executes maigret/__main__.py with __name__ == '__main__'
+        "runpy.run_module('maigret', run_name='__main__')\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        cwd=str(repo_root),
+    )
+    # 130 is the conventional SIGINT exit code (128 + SIGINT=2)
+    assert result.returncode == 130, (
+        f"expected exit 130, got {result.returncode}. "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    # The user-facing message replaces the traceback
+    assert "Maigret interrupted" in result.stderr
+    # No Python traceback may leak through
+    assert "Traceback" not in result.stderr
+    assert "KeyboardInterrupt" not in result.stderr
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file permissions")
+def test_save_db_safely_returns_false_on_readonly_target(default_db, tmp_path):
+    """A read-only install must not take down a run that already finished.
+
+    Distro packages, snaps and /nix/store put the bundled database in a
+    directory the user cannot write, and it is written unconditionally at
+    the end of every run to cache activation tokens.
+    """
+    logger = Mock()
+    readonly_dir = tmp_path / "site-packages"
+    readonly_dir.mkdir()
+    target = readonly_dir / "data.json"
+    target.write_text("{}")
+    readonly_dir.chmod(0o555)
+    target.chmod(0o444)
+
+    try:
+        assert save_db_safely(default_db, str(target), logger) is False
+        assert logger.debug.called
+        # the untouched file is still the one that was there before
+        assert target.read_text() == "{}"
+    finally:
+        readonly_dir.chmod(0o755)
+        target.chmod(0o644)
+
+
+def test_save_db_safely_writes_when_target_is_writable(default_db, tmp_path):
+    logger = Mock()
+    target = tmp_path / "data.json"
+
+    assert save_db_safely(default_db, str(target), logger) is True
+    assert "sites" in json.loads(target.read_text())

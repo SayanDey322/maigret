@@ -1,11 +1,17 @@
 import ast
 import csv
 import io
+import ipaddress
 import json
 import logging
 import os
+import socket
+import tempfile
+import zipfile
 from datetime import datetime
 from typing import Dict, Any
+from urllib.parse import urlparse
+from xml.etree import ElementTree
 
 import xmind  # type: ignore[import-untyped]
 from dateutil.tz import gettz
@@ -78,15 +84,90 @@ def save_html_report(filename: str, context: dict):
         f.write(filled_template)
 
 
+PDF_EXTRA_HINT = (
+    "PDF reports require the optional 'pdf' extra. "
+    "Install it with: pip install 'maigret[pdf]'"
+)
+
+# 1x1 transparent PNG substituted for any report image URL that isn't a safe
+# public http(s) resource (see _is_safe_report_image_url).
+_BLANK_IMAGE_PATH = os.path.join(
+    os.path.dirname(os.path.realpath(__file__)), "resources", "blank.png"
+)
+
+
+def _is_safe_report_image_url(uri) -> bool:
+    """Whether ``uri`` is a public http(s) image safe to fetch during PDF render.
+
+    Report images come from scraped profile data (``ids_data['image']``), which
+    is attacker-influenced. xhtml2pdf resolves ``<img src>`` while building the
+    PDF, so an intranet or cloud-metadata URL is a request made by the machine
+    running maigret (server-side in the web UI). A src with no scheme at all is
+    worse than a URL: xhtml2pdf falls back to treating it as a local path and
+    opens it. Only allow http(s) hosts that resolve to public addresses.
+    """
+    if not isinstance(uri, str):
+        return False
+    parsed = urlparse(uri.strip())
+    if parsed.scheme not in ("http", "https"):
+        return False
+    host = parsed.hostname
+    if not host:
+        return False
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except (socket.gaierror, UnicodeError, ValueError):
+        return False
+    if not infos:
+        return False
+    for info in infos:
+        try:
+            ip = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            return False
+        mapped = getattr(ip, "ipv4_mapped", None)
+        if mapped is not None:
+            ip = mapped
+        # is_global is False for private, loopback, link-local, unspecified and
+        # CGNAT (100.64.0.0/10) addresses. Multicast and reserved ranges are
+        # still is_global on CPython, so they stay explicit: 64:ff9b::/96 is
+        # reserved but routes to IPv4 through a NAT64 gateway.
+        if not ip.is_global or ip.is_multicast or ip.is_reserved:
+            return False
+    return True
+
+
+def _pdf_report_link_callback(uri, rel):
+    """xhtml2pdf resource resolver: let safe public images through, and divert
+    everything else to a local blank placeholder so no fetch/read happens.
+
+    Returning a local path (rather than raising) keeps report generation working
+    even when a scanned profile carries a hostile image URL — a raise would abort
+    the whole PDF.
+    """
+    if _is_safe_report_image_url(uri):
+        return uri
+    return _BLANK_IMAGE_PATH
+
+
 def save_pdf_report(filename: str, context: dict):
+    # Imported lazily so that users without the optional 'pdf' extra
+    # can still import maigret.report and use other report formats.
+    try:
+        from xhtml2pdf import pisa  # type: ignore[import-untyped]
+    except ImportError as e:
+        raise RuntimeError(PDF_EXTRA_HINT) from e
+
     template, css = generate_report_template(is_pdf=True)
     filled_template = template.render(**context)
 
-    # moved here to speed up the launch of Maigret
-    from xhtml2pdf import pisa  # type: ignore[import-untyped]
-
     with open(filename, "w+b") as f:
-        pisa.pisaDocument(io.StringIO(filled_template), dest=f, default_css=css)
+        pisa.pisaDocument(
+            io.StringIO(filled_template),
+            dest=f,
+            default_css=css,
+            link_callback=_pdf_report_link_callback,
+        )
 
 
 def save_json_report(filename: str, username: str, results: dict, report_type: str):
@@ -108,7 +189,7 @@ class MaigretGraph:
         params = dict(self.other_params)
         if key in SUPPORTED_IDS:
             params = dict(self.username_params)
-        elif value.startswith('http'):
+        elif isinstance(value, str) and value.startswith('http'):
             params = dict(self.site_params)
 
         params['title'] = node_name
@@ -122,7 +203,7 @@ class MaigretGraph:
         self.G.add_edge(node1_name, node2_name, weight=2)
 
 
-def save_graph_report(filename: str, username_results: list, db: MaigretDatabase):
+def _build_maigret_graph(username_results: list, db: MaigretDatabase):
     import networkx as nx
 
     G: Any = nx.Graph()
@@ -138,7 +219,7 @@ def save_graph_report(filename: str, username_results: list, db: MaigretDatabase
         username_node_name = graph.add_node(id_type, norm_username)
 
         for website_name, dictionary in results.items():
-            if not dictionary or dictionary.get("is_similar"):
+            if dictionary.get("is_similar"):
                 continue
 
             status = dictionary.get("status")
@@ -174,7 +255,7 @@ def save_graph_report(filename: str, username_results: list, db: MaigretDatabase
                         k.endswith('_count')
                         or k.startswith('is_')
                         or k.endswith('_at')
-                        or k in 'image'
+                        or k == 'image'
                     ):
                         continue
 
@@ -200,11 +281,13 @@ def save_graph_report(filename: str, username_results: list, db: MaigretDatabase
                                 data_node_name = graph.add_node(vv, site_base_url)
                                 graph.link(list_node_name, data_node_name)
 
-                                add_ids = {
-                                    a: b for b, a in db.extract_ids_from_url(vv).items()
-                                }
-                                if add_ids:
-                                    process_ids(data_node_name, add_ids)
+                                if isinstance(vv, str):
+                                    add_ids = {
+                                        a: b
+                                        for b, a in db.extract_ids_from_url(vv).items()
+                                    }
+                                    if add_ids:
+                                        process_ids(data_node_name, add_ids)
                             ids_data_name = list_node_name
                         else:
                             ids_data_name = graph.add_node(k, norm_v)
@@ -221,11 +304,12 @@ def save_graph_report(filename: str, username_results: list, db: MaigretDatabase
                                     )
                                     graph.link(ids_data_name, new_username_node_name)
 
-                            add_ids = {
-                                k: v for v, k in db.extract_ids_from_url(v).items()
-                            }
-                            if add_ids:
-                                process_ids(ids_data_name, add_ids)
+                            if isinstance(v, str):
+                                add_ids = {
+                                    k: v for v, k in db.extract_ids_from_url(v).items()
+                                }
+                                if add_ids:
+                                    process_ids(ids_data_name, add_ids)
 
                     graph.link(parent_node, ids_data_name)
 
@@ -242,12 +326,81 @@ def save_graph_report(filename: str, username_results: list, db: MaigretDatabase
     ]
     G.remove_nodes_from(single_degree_sites)
 
+    return G
+
+
+def save_graph_report(filename: str, username_results: list, db: MaigretDatabase):
+    G = _build_maigret_graph(username_results, db)
+
     # Generate interactive visualization
     from pyvis.network import Network  # type: ignore[import-untyped]
 
-    nt = Network(notebook=True, height="750px", width="100%")
+    # cdn_resources="in_line": self-contained HTML, no lib/ folder written
+    # relative to the process cwd (pyvis's default "local" mode does that,
+    # which breaks when the report is served from a different directory).
+    nt = Network(notebook=True, height="100vh", width="100%", cdn_resources="in_line")
     nt.from_nx(G)
-    nt.show(filename)
+    # Render and write the file here instead of calling nt.show(): pyvis opens
+    # the target with open(name, "w+"), i.e. the locale encoding, which on
+    # Windows is a non-UTF-8 codepage (cp1252 by default). The inlined
+    # vis-network bundle carries several hundred non-ASCII characters of its
+    # own, so the write failed with UnicodeEncodeError for every graph report,
+    # whatever was scanned. The template already declares a utf-8 charset.
+    html = nt.generate_html(name=filename, notebook=True)
+    with open(filename, "w", encoding="utf-8") as f:
+        f.write(html)
+
+
+def _graph_to_cypher(G) -> str:
+    """Serialize a maigret networkx graph as an idempotent Cypher script.
+
+    Nodes are MERGEd on their unique ``name`` so re-importing the same report
+    does not create duplicate nodes; edges become ``[:LINKED_TO]`` relationships.
+    """
+
+    def cstr(value) -> str:
+        # Cypher single-quoted string literal, with escaping.
+        s = (
+            str(value)
+            .replace('\\', '\\\\')
+            .replace("'", "\\'")
+            .replace('\n', '\\n')
+            .replace('\r', '\\r')
+            .replace('\t', '\\t')
+        )
+        return "'" + s + "'"
+
+    lines = [
+        "// maigret Neo4j export. Import: cypher-shell -u neo4j -p <password> < <file>.cypher",
+        "CREATE CONSTRAINT maigret_node_name IF NOT EXISTS",
+        "FOR (n:MaigretNode) REQUIRE n.name IS UNIQUE;",
+        "",
+    ]
+    for node in G.nodes():
+        node_type, _, label = str(node).partition(':')
+        lines.append(
+            "MERGE (n:MaigretNode {name: %s}) SET n.type = %s, n.label = %s;"
+            % (cstr(node), cstr(node_type.strip()), cstr(label.strip()))
+        )
+    lines.append("")
+    for node1, node2 in G.edges():
+        lines.append(
+            "MATCH (a:MaigretNode {name: %s}), (b:MaigretNode {name: %s}) "
+            "MERGE (a)-[:LINKED_TO]->(b);" % (cstr(node1), cstr(node2))
+        )
+    lines.append("")
+    return "\n".join(lines)
+
+
+def save_neo4j_report(filename: str, username_results: list, db: MaigretDatabase):
+    """Save a Neo4j Cypher report of the maigret graph (see ``_graph_to_cypher``).
+
+    Load the resulting file with ``cypher-shell -u neo4j -p <password> < file``
+    or paste it into the Neo4j Browser.
+    """
+    G = _build_maigret_graph(username_results, db)
+    with open(filename, 'w', encoding='utf-8') as f:
+        f.write(_graph_to_cypher(G))
 
 
 def get_plaintext_report(context: dict) -> str:
@@ -415,7 +568,9 @@ def generate_report_template(is_pdf: bool):
     """
 
     def get_resource_content(filename):
-        return open(os.path.join(maigret_path, "resources", filename)).read()
+        path = os.path.join(maigret_path, "resources", filename)
+        with open(path, encoding="utf-8") as f:
+            return f.read()
 
     maigret_path = os.path.dirname(os.path.realpath(__file__))
 
@@ -426,7 +581,9 @@ def generate_report_template(is_pdf: bool):
         template_content = get_resource_content("simple_report.tpl")
         css_content = None
 
-    template = Template(template_content)
+    # autoescape: report data comes from scanned profiles and must be escaped
+    # to avoid XSS in the generated report.
+    template = Template(template_content, autoescape=True)
     template.globals["title"] = CaseConverter.snake_to_title  # type: ignore
     template.globals["detect_link"] = enrich_link_str  # type: ignore
     return template, css_content
@@ -451,10 +608,6 @@ def generate_report_context(username_results: list):
 
         for website_name in results:
             dictionary = results[website_name]
-            # TODO: fix no site data issue
-            if not dictionary:
-                continue
-
             if dictionary.get("is_similar"):
                 continue
 
@@ -499,14 +652,13 @@ def generate_report_context(username_results: list):
                     # suppose country
                     if k in ["country", "locale"]:
                         try:
-                            if is_country_tag(k):
+                            if is_country_tag(v):
                                 country = pycountry.countries.get(alpha_2=v)
                                 tag = country.alpha_2.lower()  # type: ignore[union-attr]
                             else:
                                 tag = pycountry.countries.search_fuzzy(v)[
                                     0
                                 ].alpha_2.lower()  # type: ignore[attr-defined]
-                            # TODO: move countries to another struct
                             tags[tag] = tags.get(tag, 0) + 1
                         except Exception as e:
                             logging.debug(
@@ -558,7 +710,6 @@ def generate_report_context(username_results: list):
 
     return {
         "username": first_username,
-        # TODO: return brief list
         "brief": brief,
         "results": username_results,
         "first_seen": first_seen,
@@ -572,13 +723,22 @@ def generate_report_context(username_results: list):
 def generate_csv_report(username: str, results: dict, csvfile):
     writer = csv.writer(csvfile)
     writer.writerow(
-        ["username", "name", "url_main", "url_user", "exists", "http_status"]
+        [
+            "username",
+            "name",
+            "url_main",
+            "url_user",
+            "exists",
+            "http_status",
+            "error_reason",
+        ]
     )
     for site in results:
-        # TODO: fix the reason
         status = 'Unknown'
-        if "status" in results[site]:
-            status = str(results[site]["status"].status)
+        result_status = results[site].get("status")
+        error_reason = _get_result_error_reason(result_status)
+        if result_status:
+            status = str(result_status.status)
         writer.writerow(
             [
                 username,
@@ -587,17 +747,34 @@ def generate_csv_report(username: str, results: dict, csvfile):
                 results[site].get("url_user", ""),
                 status,
                 results[site].get("http_status", 0),
+                error_reason,
             ]
         )
+
+
+def _get_result_error_reason(result_status):
+    if not result_status:
+        return 'Unknown'
+
+    if result_status.error:
+        context = getattr(result_status.error, 'context', None)
+        if context:
+            return str(context)
+        return str(result_status.error)
+
+    if result_status.context:
+        return str(result_status.context)
+
+    if result_status.status == MaigretCheckStatus.UNKNOWN:
+        return 'Unknown'
+
+    return ''
 
 
 def generate_txt_report(username: str, results: dict, file):
     exists_counter = 0
     for website_name in results:
         dictionary = results[website_name]
-        # TODO: fix no site data issue
-        if not dictionary:
-            continue
         if (
             dictionary.get("status")
             and dictionary["status"].status == MaigretCheckStatus.CLAIMED
@@ -613,8 +790,7 @@ def generate_json_report(username: str, results: dict, file, report_type):
 
     for sitename in results:
         site_result = results[sitename]
-        # TODO: fix no site data issue
-        if not site_result or not site_result.get("status"):
+        if not site_result.get("status"):
             continue
 
         if site_result["status"].status != MaigretCheckStatus.CLAIMED:
@@ -638,8 +814,110 @@ def generate_json_report(username: str, results: dict, file, report_type):
 
 
 """
-XMIND 8 Functions
+XMIND Functions
 """
+
+
+_XMIND_MANIFEST_PATH = "META-INF/manifest.xml"
+_XMIND_MANIFEST_NAMESPACE = "urn:xmind:xmap:xmlns:manifest:1.0"
+_XMIND_ZIP_EPOCH = (1980, 1, 1, 0, 0, 0)
+
+
+def _xmind_member_media_type(name):
+    if name.endswith('/'):
+        return ''
+    if name.endswith('.xml'):
+        return 'text/xml'
+    if name.endswith('.json'):
+        return 'application/json'
+    return 'application/octet-stream'
+
+
+def _build_xmind_manifest(member_names):
+    ElementTree.register_namespace('', _XMIND_MANIFEST_NAMESPACE)
+    root = ElementTree.Element(
+        f'{{{_XMIND_MANIFEST_NAMESPACE}}}manifest', {'password-hint': ''}
+    )
+    for name in member_names:
+        ElementTree.SubElement(
+            root,
+            f'{{{_XMIND_MANIFEST_NAMESPACE}}}file-entry',
+            {
+                'full-path': name,
+                'media-type': _xmind_member_media_type(name),
+            },
+        )
+    return ElementTree.tostring(root, encoding='utf-8', xml_declaration=True)
+
+
+def _validate_xmind_archive(filename, expected_names):
+    with zipfile.ZipFile(filename) as archive:
+        invalid_member = archive.testzip()
+        if invalid_member is not None:
+            raise ValueError(f'Invalid XMind ZIP member: {invalid_member}')
+
+        names = archive.namelist()
+        if names != expected_names:
+            raise ValueError('Rewritten XMind archive has unexpected members')
+        if names.count(_XMIND_MANIFEST_PATH) != 1:
+            raise ValueError('Rewritten XMind archive must contain one manifest')
+
+        manifest = ElementTree.fromstring(archive.read(_XMIND_MANIFEST_PATH))
+        entry_tag = f'{{{_XMIND_MANIFEST_NAMESPACE}}}file-entry'
+        manifest_names = [
+            entry.attrib.get('full-path') for entry in manifest.findall(entry_tag)
+        ]
+        if manifest_names != expected_names:
+            raise ValueError('XMind manifest does not list every archive member')
+
+
+def _normalize_xmind_archive(filename):
+    """Atomically add the manifest required by current XMind readers."""
+    archive_path = os.fspath(filename)
+    archive_dir = os.path.dirname(os.path.abspath(archive_path))
+    archive_mode = os.stat(archive_path).st_mode & 0o7777
+    temporary_fd, temporary_path = tempfile.mkstemp(
+        prefix=f'.{os.path.basename(archive_path)}.',
+        suffix='.tmp',
+        dir=archive_dir,
+    )
+    os.close(temporary_fd)
+
+    try:
+        with zipfile.ZipFile(archive_path) as source:
+            members = [
+                member
+                for member in source.infolist()
+                if member.filename != _XMIND_MANIFEST_PATH
+            ]
+            expected_names = [member.filename for member in members]
+            expected_names.append(_XMIND_MANIFEST_PATH)
+            manifest = _build_xmind_manifest(expected_names)
+
+            with zipfile.ZipFile(temporary_path, mode='w') as target:
+                target.comment = source.comment
+                for member in members:
+                    target.writestr(member, source.read(member))
+
+                manifest_info = zipfile.ZipInfo(
+                    _XMIND_MANIFEST_PATH, date_time=_XMIND_ZIP_EPOCH
+                )
+                manifest_info.compress_type = zipfile.ZIP_DEFLATED
+                manifest_info.create_system = 3
+                manifest_info.external_attr = 0o100644 << 16
+                target.writestr(manifest_info, manifest)
+
+        os.chmod(temporary_path, archive_mode)
+        _validate_xmind_archive(temporary_path, expected_names)
+        with open(temporary_path, 'rb') as temporary_file:
+            os.fsync(temporary_file.fileno())
+        os.replace(temporary_path, archive_path)
+    except BaseException:
+        try:
+            os.unlink(temporary_path)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def save_xmind_report(filename, username, results):
@@ -649,6 +927,7 @@ def save_xmind_report(filename, username, results):
     sheet = workbook.getPrimarySheet()
     design_xmind_sheet(sheet, username, results)
     xmind.save(workbook, path=filename)
+    _normalize_xmind_archive(filename)
 
 
 def add_xmind_subtopic(userlink, k, v, supposed_data):
@@ -671,14 +950,24 @@ def design_xmind_sheet(sheet, username, results):
     undefinedsection = root_topic1.addSubTopic()
     undefinedsection.setTitle("Undefined")
     alltags["undefined"] = undefinedsection
+    error_section = None
 
     for website_name in results:
         dictionary = results[website_name]
-        if not dictionary:
-            continue
         result_status = dictionary.get("status")
-        # TODO: fix the reason
         if not result_status or result_status.status != MaigretCheckStatus.CLAIMED:
+            error_reason = _get_result_error_reason(result_status)
+            if not error_reason:
+                continue
+
+            if error_section is None:
+                error_section = root_topic1.addSubTopic()
+                error_section.setTitle("Errors")
+
+            userlink = error_section.addSubTopic()
+            userlink.setTitle(f"{website_name}: {error_reason}")
+            if dictionary.get("url_user"):
+                userlink.addLabel(dictionary["url_user"])
             continue
 
         stripped_tags = list(map(lambda x: x.strip(), result_status.tags))
